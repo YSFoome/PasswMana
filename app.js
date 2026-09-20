@@ -344,7 +344,13 @@ function modalTemplate() {
   }
   if (state.modal.type === 'sync') {
     const configured = state.vault.sync.owner && state.vault.sync.repo && state.vault.sync.token;
-    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地有待同步改动' : '没有待同步改动'}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote">${icon('download')}从远端拉取</button><button class="primary-button" data-action="push-remote">${icon('upload')}推送本地改动</button></div><p class="dialog-note">拉取会更新本地密码条目，并保留本机解锁密钥和同步配置。推送会先检查远端版本以避免覆盖。</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
+    const isPulling = state.syncing === 'pull';
+    const isPushing = state.syncing === 'push';
+    const disabled = state.syncing ? 'disabled' : '';
+    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地有待同步改动' : '没有待同步改动'}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取...` : `${icon('download')}从远端拉取`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送...` : `${icon('upload')}推送本地改动`}</button></div><p class="dialog-note">拉取会更新本地密码条目，并保留本机解锁密钥和同步配置。推送会先检查远端版本以避免覆盖。</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
+  }
+  if (state.modal.type === 'sync-result') {
+    return `<div class="modal-layer open" data-modal-layer><section class="modal" role="alertdialog" aria-labelledby="sync-result-title"><header class="modal-head"><h2 id="sync-result-title">${escapeHtml(state.modal.title)}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-result">${icon('circle-alert')}<span>${escapeHtml(state.modal.message)}</span></div></div><footer class="modal-foot"><button class="primary-button" data-action="close-modal">知道了</button></footer></section></div>`;
   }
   if (state.modal.type === 'sync-config') {
     const sync = state.vault.sync;
@@ -359,15 +365,10 @@ function modalTemplate() {
   return '';
 }
 
-function syncProgressTemplate() {
-  if (!state.syncing) return '';
-  return `<div class="sync-progress-layer" role="status" aria-live="polite"><div class="sync-progress">${icon('loader-circle', 'is-spinning')}<span>正在从远端拉取...</span></div></div>`;
-}
-
 function renderApp() {
   const title = state.view === 'vault' ? '密码库' : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
   const nav = `<nav class="main-nav"><button class="nav-link ${state.view === 'vault' ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}密码库</button><button class="nav-link ${state.view === 'settings' ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}设置</button></nav>`;
-  app.innerHTML = `<div class="app-shell"><aside class="side-nav"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="打开导航" aria-label="打开导航">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync"><span class="sync-dot"></span><span>${state.record.dirty ? '有本地改动' : '已同步'}</span>${icon('refresh-cw')}</button></div></header><div class="page">${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside>${modalTemplate()}${syncProgressTemplate()}<div class="toast-wrap" id="toast-wrap"></div>`;
+  app.innerHTML = `<div class="app-shell"><aside class="side-nav"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="打开导航" aria-label="打开导航">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync"><span class="sync-dot"></span><span>${state.record.dirty ? '有本地改动' : '已同步'}</span>${icon('refresh-cw')}</button></div></header><div class="page">${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap"></div>`;
   queueMicrotask(drawIcons);
 }
 
@@ -484,7 +485,6 @@ async function remoteRequest(method, sync, body) {
 async function pullRemote() {
   const sync = state.vault.sync;
   if (!confirm('将以远端版本更新此设备的密码条目。此设备的解锁密钥和同步配置会保留。是否继续？')) return;
-  state.modal = null;
   state.syncing = 'pull';
   render();
   try {
@@ -522,13 +522,15 @@ async function pullRemote() {
     toast('已从远端拉取，保险库保持解锁');
   } catch (error) {
     state.syncing = null;
+    state.modal = { type: 'sync-result', title: '拉取失败', message: error.message || '无法从远端拉取保险库' };
     render();
-    toast(`拉取失败: ${error.message}`);
   }
 }
 
 async function pushRemote() {
   const sync = state.vault.sync;
+  state.syncing = 'push';
+  render();
   try {
     const remote = await remoteRequest('GET', sync);
     if (remote && state.record.remoteSha && remote.sha !== state.record.remoteSha) throw new Error('远端版本已变化，请先拉取');
@@ -538,10 +540,15 @@ async function pushRemote() {
     state.record.remoteSha = result.content.sha;
     state.record.dirty = false;
     await dbPut(state.record);
+    state.syncing = null;
     state.modal = null;
     render();
     toast('已推送加密保险库');
-  } catch (error) { toast(`推送失败: ${error.message}`); }
+  } catch (error) {
+    state.syncing = null;
+    state.modal = { type: 'sync-result', title: '推送失败', message: error.message || '无法推送保险库到远端' };
+    render();
+  }
 }
 
 async function handleSubmit(event) {

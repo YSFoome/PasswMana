@@ -61,6 +61,7 @@ textarea.field { min-height: 86px; padding: 10px 12px; resize: vertical; }
 .primary-button { border-color: var(--primary); background: var(--primary); color: var(--primary-ink); }
 .primary-button:hover { filter: brightness(.96); }
 .secondary-button:hover { background: var(--surface-hover); }
+.primary-button:disabled, .secondary-button:disabled, .icon-button:disabled { cursor: wait; opacity: .72; }
 .danger-button { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); color: var(--danger); }
 .button-row { display: flex; justify-content: flex-end; gap: 9px; margin-top: 6px; }
 .recovery-box { margin: 20px 0; padding: 17px; border: 1px dashed color-mix(in srgb, var(--warning) 56%, var(--line)); border-radius: 7px; background: var(--warning-soft); color: var(--warning); }
@@ -180,9 +181,8 @@ button.category-row:hover { background: var(--surface-hover); }
 .dialog-note { margin: 15px 0 0; color: var(--muted); font-size: 12px; }
 .toast-wrap { position: fixed; bottom: 24px; left: 50%; z-index: 70; display: grid; gap: 8px; transform: translateX(-50%); }
 .toast { min-width: 180px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: var(--shadow); color: var(--text); text-align: center; }
-.sync-progress-layer { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 24px; background: rgba(8, 12, 9, .18); }
-.sync-progress { display: inline-flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: var(--shadow); color: var(--text); font-weight: 700; }
-.sync-progress svg { width: 19px; color: var(--primary); }
+.sync-result { display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--line)); border-radius: 6px; background: var(--danger-soft); color: var(--danger); }
+.sync-result svg { width: 19px; flex: none; }
 .is-spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
