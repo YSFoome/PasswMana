@@ -18,6 +18,7 @@ const state = {
   favoriteOnly: false,
   modal: null,
   syncing: null,
+  pendingRemote: null,
   drawerOpen: false,
   timer: null,
 };
@@ -169,6 +170,7 @@ function lockVault() {
   state.rawVaultKey = null;
   state.vault = null;
   state.modal = null;
+  state.pendingRemote = null;
   state.drawerOpen = false;
   render();
 }
@@ -344,13 +346,19 @@ function modalTemplate() {
   }
   if (state.modal.type === 'sync') {
     const configured = state.vault.sync.owner && state.vault.sync.repo && state.vault.sync.token;
+    const firstConnection = !state.record.remoteSha;
     const isPulling = state.syncing === 'pull';
     const isPushing = state.syncing === 'push';
     const disabled = state.syncing ? 'disabled' : '';
-    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地有待同步改动' : '没有待同步改动'}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取...` : `${icon('download')}从远端拉取`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送...` : `${icon('upload')}推送本地改动`}</button></div><p class="dialog-note">拉取会更新本地密码条目，并保留本机解锁密钥和同步配置。推送会先检查远端版本以避免覆盖。</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
+    const status = firstConnection ? '首次连接：建议先从远端导入保险库' : state.record.dirty ? '本地有待同步改动' : '没有待同步改动';
+    const note = firstConnection ? '若私有仓库已有保险库，请选择“从远端导入”。只有仓库尚无密文时才选择“初始化远端”。' : '单用户模式下，拉取直接采用远端版本，推送直接更新远端版本。';
+    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(firstConnection || state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${status}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取...` : `${icon('download')}${firstConnection ? '从远端导入' : '从远端拉取'}`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送...` : `${icon('upload')}${firstConnection ? '初始化远端' : '推送本地改动'}`}</button></div><p class="dialog-note">${note}</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
   }
   if (state.modal.type === 'sync-result') {
     return `<div class="modal-layer open" data-modal-layer><section class="modal" role="alertdialog" aria-labelledby="sync-result-title"><header class="modal-head"><h2 id="sync-result-title">${escapeHtml(state.modal.title)}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-result">${icon('circle-alert')}<span>${escapeHtml(state.modal.message)}</span></div></div><footer class="modal-foot"><button class="primary-button" data-action="close-modal">知道了</button></footer></section></div>`;
+  }
+  if (state.modal.type === 'remote-unlock') {
+    return `<div class="modal-layer open form-open" data-modal-layer><form class="modal" data-form="remote-unlock"><header class="modal-head"><h2>首次导入保险库</h2><button class="icon-button" type="button" data-action="close-modal" title="取消" aria-label="取消">${icon('x')}</button></header><div class="modal-body"><div class="form-stack"><p class="panel-intro">此设备尚未绑定远端保险库。输入远端主密码一次即可完成导入；以后拉取和推送将保持解锁，无需再次验证。</p><label class="form-field">远端主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" required autofocus /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label></div></div><footer class="modal-foot"><button class="secondary-button" type="button" data-action="close-modal">取消</button><button class="primary-button" type="submit">导入并保持解锁</button></footer></form></div>`;
   }
   if (state.modal.type === 'sync-config') {
     const sync = state.vault.sync;
@@ -484,7 +492,7 @@ async function remoteRequest(method, sync, body) {
 
 async function pullRemote() {
   const sync = state.vault.sync;
-  if (!confirm('将以远端版本更新此设备的密码条目。此设备的解锁密钥和同步配置会保留。是否继续？')) return;
+  if (!state.record.remoteSha && !confirm('这是首次连接。将从私有仓库导入保险库；原有本地条目不会保留。是否继续？')) return;
   state.syncing = 'pull';
   render();
   try {
@@ -500,15 +508,10 @@ async function pullRemote() {
     } catch {
       payload.remoteSha = remote.sha;
       payload.dirty = false;
-      await dbPut(payload);
-      state.record = payload;
-      state.vaultKey = null;
-      state.rawVaultKey = null;
-      state.vault = null;
-      state.modal = null;
       state.syncing = null;
+      state.pendingRemote = { payload, sync };
+      state.modal = { type: 'remote-unlock' };
       render();
-      toast('远端保险库使用不同密钥，已拉取，请使用远端主密码解锁');
       return;
     }
 
@@ -529,11 +532,11 @@ async function pullRemote() {
 
 async function pushRemote() {
   const sync = state.vault.sync;
+  if (!state.record.remoteSha && !confirm('将把本机保险库作为私有仓库的初始内容。若远端已有密文，它将被覆盖。是否继续？')) return;
   state.syncing = 'push';
   render();
   try {
     const remote = await remoteRequest('GET', sync);
-    if (remote && state.record.remoteSha && remote.sha !== state.record.remoteSha) throw new Error('远端版本已变化，请先拉取');
     const record = { ...state.record, remoteSha: undefined, dirty: false };
     const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
     const result = await remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
@@ -578,6 +581,22 @@ async function handleSubmit(event) {
       state.vault = unlocked.vault;
       pruneTrash();
       render();
+      return;
+    }
+    if (form.dataset.form === 'remote-unlock') {
+      const pending = state.pendingRemote;
+      if (!pending) throw new Error('远端拉取会话已失效，请重新拉取');
+      const unlocked = await unlockWithMaster(pending.payload, values.get('password'));
+      unlocked.vault.sync = pending.sync;
+      state.record = pending.payload;
+      state.vaultKey = unlocked.vaultKey;
+      state.rawVaultKey = unlocked.rawVaultKey;
+      state.vault = unlocked.vault;
+      await persistVault({ dirty: false });
+      state.pendingRemote = null;
+      state.modal = null;
+      render();
+      toast('已从远端拉取，保险库保持解锁');
       return;
     }
     if (form.dataset.form === 'add-entry' || form.dataset.form === 'edit-entry') {
@@ -637,6 +656,8 @@ async function handleSubmit(event) {
       ? '主密码错误，无法解锁保险库'
       : form.dataset.form === 'recovery-reset'
         ? '恢复密钥无效，无法重设主密码'
+        : form.dataset.form === 'remote-unlock'
+          ? '远端主密码错误，无法完成拉取'
         : (error.message || '操作失败');
     toast(friendlyError);
   }
@@ -672,7 +693,7 @@ async function handleAction(event) {
   if (action === 'select-category') { state.category = control.dataset.category; state.modal = null; render(); return; }
   if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
   if (action === 'open-detail') { state.modal = { type: 'detail', id: control.dataset.id, revealed: false }; render(); return; }
-  if (action === 'close-modal') { state.modal = null; render(); return; }
+  if (action === 'close-modal') { if (state.modal?.type === 'remote-unlock') state.pendingRemote = null; state.modal = null; render(); return; }
   if (action === 'reveal-password') { state.modal.revealed = !state.modal.revealed; render(); return; }
   if (action === 'copy-password') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); await copyText(entry.password, '密码已复制，30 秒后清空剪贴板'); return; }
   if (action === 'open-edit') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); state.modal = { type: 'edit', entry }; render(); return; }

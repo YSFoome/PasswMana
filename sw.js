@@ -1,4 +1,4 @@
-const CACHE_NAME = 'passwmana-static-v6';
+const CACHE_NAME = 'passwmana-static-v8';
 const APP_SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (event) => {
