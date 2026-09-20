@@ -1,16 +1,26 @@
-# React + Vite
+# PasswMana
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+PasswMana is a zero-build, offline-first password vault for GitHub Pages. It stores the encrypted vault in IndexedDB and can manually pull or push the ciphertext to a separate private GitHub repository.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Serve this directory over HTTP so the service worker can install:
 
-## React Compiler
+```powershell
+npx serve .
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Open the reported URL. Creating a vault generates a recovery key once; save it offline before continuing.
 
-## Expanding the ESLint configuration
+Legacy plaintext JSON backups from the React version can be merged from Settings > Sync and Backup > Migrate Legacy Backup. Migration happens locally and immediately re-encrypts valid entries; securely delete the old plaintext file after verification.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Deploy to GitHub Pages
+
+Push the repository contents to `YSFoome/PasswMana` and configure GitHub Pages to deploy from the branch root. The application uses relative asset URLs, so it works at the `/PasswMana/` project path without a build step.
+
+## Security Model
+
+- The master password and recovery key wrap a random AES-GCM vault key; neither secret is saved.
+- Vault entries and GitHub Fine-grained PAT configuration are encrypted together before writing to IndexedDB or the private repository.
+- The public Pages repository must never contain a vault backup, PAT, master password, or recovery key.
+- Sync is deliberately manual. A changed remote version blocks push until the user pulls it; pull gives the remote encrypted version priority.
