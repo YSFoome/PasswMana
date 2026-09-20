@@ -477,22 +477,38 @@ async function remoteRequest(method, sync, body) {
 
 async function pullRemote() {
   const sync = state.vault.sync;
-  if (!confirm('将以远端密文覆盖此设备的本地保险库。是否继续？')) return;
+  if (!confirm('将以远端版本更新此设备的密码条目。此设备的解锁密钥和同步配置会保留。是否继续？')) return;
   try {
     const remote = await remoteRequest('GET', sync);
     if (!remote) throw new Error('远端尚未找到保险库文件');
     const payload = JSON.parse(new TextDecoder().decode(base64ToBytes(remote.content.replace(/\n/g, ''))));
     if (payload.format !== 'passwmana-v1') throw new Error('远端文件格式不正确');
-    payload.remoteSha = remote.sha;
-    payload.dirty = false;
-    await dbPut(payload);
-    state.record = payload;
-    state.vaultKey = null;
-    state.rawVaultKey = null;
-    state.vault = null;
+
+    // A usual pull is another revision of this vault, so keep device-local key wrappers and sync credentials.
+    let remoteVault;
+    try {
+      remoteVault = JSON.parse(await decryptText(payload.encryptedVault, state.vaultKey));
+    } catch {
+      payload.remoteSha = remote.sha;
+      payload.dirty = false;
+      await dbPut(payload);
+      state.record = payload;
+      state.vaultKey = null;
+      state.rawVaultKey = null;
+      state.vault = null;
+      state.modal = null;
+      render();
+      toast('远端保险库使用不同密钥，已拉取，请使用远端主密码解锁');
+      return;
+    }
+
+    remoteVault.sync = sync;
+    state.vault = remoteVault;
+    state.record.remoteSha = remote.sha;
+    await persistVault({ dirty: false });
     state.modal = null;
     render();
-    toast('已拉取远端保险库，请重新解锁');
+    toast('已拉取远端保险库，保持解锁');
   } catch (error) { toast(`拉取失败: ${error.message}`); }
 }
 
