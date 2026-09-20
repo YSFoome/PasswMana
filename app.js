@@ -270,12 +270,22 @@ function entryTemplate(entry) {
   return `<button class="entry" data-action="open-detail" data-id="${entry.id}"><span class="entry-site"><span class="site-icon">${titleInitial(entry)}</span><span><strong>${escapeHtml(entry.title)}</strong><small>${escapeHtml(maskAccount(entry.username))}</small></span></span><span class="pill">${escapeHtml(entry.category)}</span><span class="pill">${entry.url ? '网站' : '账户'}</span><time>${timeLabel(entry.updatedAt)}</time>${entry.favorite ? icon('star', 'starred') : icon('chevron-right', 'chevron')}</button>`;
 }
 
-function renderVault() {
+function vaultListTemplate() {
   const entries = currentEntries();
   const favorites = entries.filter((entry) => entry.favorite);
   const rest = entries.filter((entry) => !entry.favorite);
-  const list = entries.length ? `${favorites.length ? `<div class="group-heading">收藏 <span>${favorites.length}</span></div>${favorites.map(entryTemplate).join('')}` : ''}${rest.length ? `<div class="group-heading">${favorites.length ? '全部条目' : '密码条目'} <span>${rest.length}</span></div>${rest.map(entryTemplate).join('')}` : ''}` : `<div class="empty-state">${icon('vault')}<div>没有匹配的密码条目</div></div>`;
-  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="notice"><div class="notice-copy">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地改动尚未同步到私有仓库' : '本地保险库已与私有仓库同步'}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}手动同步</button></div><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索站点、账户或分类" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list">${list}</div></section>`;
+  return entries.length ? `${favorites.length ? `<div class="group-heading">收藏 <span>${favorites.length}</span></div>${favorites.map(entryTemplate).join('')}` : ''}${rest.length ? `<div class="group-heading">${favorites.length ? '全部条目' : '密码条目'} <span>${rest.length}</span></div>${rest.map(entryTemplate).join('')}` : ''}` : `<div class="empty-state">${icon('vault')}<div>没有匹配的密码条目</div></div>`;
+}
+
+function updateVaultList() {
+  const list = app.querySelector('[data-vault-list]');
+  if (!list) return;
+  list.innerHTML = vaultListTemplate();
+  drawIcons();
+}
+
+function renderVault() {
+  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="notice"><div class="notice-copy">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地改动尚未同步到私有仓库' : '本地保险库已与私有仓库同步'}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}手动同步</button></div><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索站点、账户或分类" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
 }
 
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: 'Appearance', categories: '分类', trash: '回收站' };
@@ -316,6 +326,10 @@ function renderSettings() {
 
 function modalTemplate() {
   if (!state.modal) return '';
+  if (state.modal.type === 'category-filter') {
+    const options = [['', '全部分类'], ...state.vault.categories.map((category) => [category, category])];
+    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>分类筛选</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="category-list">${options.map(([value, label]) => `<button class="category-row" data-action="select-category" data-category="${escapeHtml(value)}"><span><i class="category-dot"></i>${escapeHtml(label)}</span>${state.category === value ? icon('check') : ''}</button>`).join('')}</div></div></section></div>`;
+  }
   if (state.modal.type === 'add' || state.modal.type === 'edit') {
     const entry = state.modal.entry || { title: '', username: '', password: '', category: state.vault.categories[0] || '', url: '', notes: '', favorite: false };
     const editing = state.modal.type === 'edit';
@@ -615,7 +629,9 @@ async function handleAction(event) {
   if (action === 'setting-panel') { state.settingPanel = control.dataset.panel; if (window.matchMedia('(max-width: 899px)').matches) state.settingsDetail = true; render(); return; }
   if (action === 'set-mode') { document.documentElement.dataset.mode = control.dataset.mode; localStorage.setItem('passwmana-mode', control.dataset.mode); render(); return; }
   if (action === 'set-accent') { document.documentElement.dataset.accent = control.dataset.accent; localStorage.setItem('passwmana-accent', control.dataset.accent); document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.documentElement).getPropertyValue('--primary').trim(); render(); return; }
-  if (action === 'toggle-favorite-filter') { state.favoriteOnly = !state.favoriteOnly; render(); return; }
+  if (action === 'toggle-favorite-filter') { state.favoriteOnly = !state.favoriteOnly; control.classList.toggle('active', state.favoriteOnly); updateVaultList(); return; }
+  if (action === 'open-category-filter') { state.modal = { type: 'category-filter' }; render(); return; }
+  if (action === 'select-category') { state.category = control.dataset.category; state.modal = null; render(); return; }
   if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
   if (action === 'open-detail') { state.modal = { type: 'detail', id: control.dataset.id, revealed: false }; render(); return; }
   if (action === 'close-modal') { state.modal = null; render(); return; }
@@ -640,9 +656,9 @@ async function handleAction(event) {
 
 app.addEventListener('click', (event) => { handleAction(event).catch((error) => toast(error.message || '操作失败')); });
 app.addEventListener('submit', handleSubmit);
-app.addEventListener('input', (event) => { if (event.target.dataset.input === 'search') { state.search = event.target.value; render(); } resetLockTimer(); });
+app.addEventListener('input', (event) => { if (event.target.dataset.input === 'search') { state.search = event.target.value; updateVaultList(); } resetLockTimer(); });
 app.addEventListener('change', async (event) => {
-  if (event.target.dataset.input === 'category') { state.category = event.target.value; render(); }
+  if (event.target.dataset.input === 'category') { state.category = event.target.value; updateVaultList(); }
   if (event.target.dataset.input === 'lock-minutes') { state.vault.preferences.lockMinutes = Number(event.target.value); await persistVault(); resetLockTimer(); toast('自动锁定设置已保存'); }
 });
 
