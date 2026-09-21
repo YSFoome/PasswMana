@@ -2,6 +2,7 @@ const DB_NAME = 'passwmana';
 const STORE_NAME = 'vault';
 const RECORD_KEY = 'primary';
 const PBKDF2_ITERATIONS = 600000;
+const MAX_SYNC_ATTEMPTS = 3;
 const DEFAULT_CATEGORIES = ['工作', '个人', '金融'];
 
 const app = document.getElementById('app');
@@ -18,6 +19,8 @@ const state = {
   favoriteOnly: false,
   modal: null,
   syncing: null,
+  syncAttempt: null,
+  syncLastError: null,
   pendingRemote: null,
   drawerOpen: false,
   timer: null,
@@ -350,9 +353,11 @@ function modalTemplate() {
     const isPulling = state.syncing === 'pull';
     const isPushing = state.syncing === 'push';
     const disabled = state.syncing ? 'disabled' : '';
+    const attemptLabel = state.syncing ? `（第 ${state.syncAttempt || 1}/${MAX_SYNC_ATTEMPTS} 次）` : '';
     const status = firstConnection ? '首次连接：建议先从远端导入保险库' : state.record.dirty ? '本地有待同步改动' : '没有待同步改动';
     const note = firstConnection ? '若私有仓库已有保险库，请选择“从远端导入”。只有仓库尚无密文时才选择“初始化远端”。' : '单用户模式下，拉取直接采用远端版本，推送直接更新远端版本。';
-    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(firstConnection || state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${status}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取...` : `${icon('download')}${firstConnection ? '从远端导入' : '从远端拉取'}`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送...` : `${icon('upload')}${firstConnection ? '初始化远端' : '推送本地改动'}`}</button></div><p class="dialog-note">${note}</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
+    const retryNote = state.syncLastError ? `<p class="sync-retry-note">上次尝试失败：${escapeHtml(state.syncLastError.message)}</p>` : '';
+    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>手动同步</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(firstConnection || state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${status}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取${attemptLabel}...` : `${icon('download')}${firstConnection ? '从远端导入' : '从远端拉取'}`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送${attemptLabel}...` : `${icon('upload')}${firstConnection ? '初始化远端' : '推送本地改动'}`}</button></div>${retryNote}<p class="dialog-note">${note}</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
   }
   if (state.modal.type === 'sync-result') {
     return `<div class="modal-layer open" data-modal-layer><section class="modal" role="alertdialog" aria-labelledby="sync-result-title"><header class="modal-head"><h2 id="sync-result-title">${escapeHtml(state.modal.title)}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-result">${icon('circle-alert')}<span>${escapeHtml(state.modal.message)}</span></div></div><footer class="modal-foot"><button class="primary-button" data-action="close-modal">知道了</button></footer></section></div>`;
@@ -495,31 +500,63 @@ async function remoteRequest(method, sync, body) {
   return result;
 }
 
-async function putRemoteWithRetry(sync, record) {
-  const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
-  let remote = await remoteRequest('GET', sync);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+function isRetryableSyncError(error) {
+  if (error.retryable === false) return false;
+  if (!error.status) return true;
+  return [408, 409, 425, 429].includes(error.status) || error.status >= 500;
+}
+
+async function withSyncRetry(operation) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_SYNC_ATTEMPTS; attempt += 1) {
+    state.syncAttempt = attempt;
+    if (attempt > 1) {
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt - 1)));
+    }
     try {
-      return await remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
+      return await operation(attempt);
     } catch (error) {
-      if (error.status !== 409 || attempt === 2) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-      remote = await remoteRequest('GET', sync);
+      lastError = error;
+      if (!isRetryableSyncError(error) || attempt === MAX_SYNC_ATTEMPTS) throw error;
+      state.syncLastError = error;
+      state.syncAttempt = attempt + 1;
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
     }
   }
-  throw new Error('无法完成远端推送');
+  throw lastError || new Error('同步失败');
+}
+
+async function putRemoteOnce(sync, record) {
+  const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
+  const remote = await remoteRequest('GET', sync);
+  return remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
 }
 
 async function pullRemote() {
   const sync = state.vault.sync;
   if (!state.record.remoteSha && !confirm('这是首次连接。将从私有仓库导入保险库；原有本地条目不会保留。是否继续？')) return;
   state.syncing = 'pull';
+  state.syncAttempt = 1;
+  state.syncLastError = null;
   render();
   try {
-    const remote = await remoteRequest('GET', sync);
-    if (!remote) throw new Error('远端尚未找到保险库文件');
-    const payload = JSON.parse(new TextDecoder().decode(base64ToBytes(remote.content.replace(/\n/g, ''))));
-    if (payload.format !== 'passwmana-v1') throw new Error('远端文件格式不正确');
+    const { remote, payload } = await withSyncRetry(async () => {
+      const nextRemote = await remoteRequest('GET', sync);
+      if (!nextRemote) {
+        const error = new Error('远端尚未找到保险库文件');
+        error.status = 404;
+        throw error;
+      }
+      const nextPayload = JSON.parse(new TextDecoder().decode(base64ToBytes(nextRemote.content.replace(/\n/g, ''))));
+      if (nextPayload.format !== 'passwmana-v1') {
+        const error = new Error('远端文件格式不正确');
+        error.retryable = false;
+        throw error;
+      }
+      return { remote: nextRemote, payload: nextPayload };
+    });
 
     // A usual pull is another revision of this vault, so keep device-local key wrappers and sync credentials.
     let remoteVault;
@@ -529,6 +566,8 @@ async function pullRemote() {
       payload.remoteSha = remote.sha;
       payload.dirty = false;
       state.syncing = null;
+      state.syncAttempt = null;
+      state.syncLastError = null;
       state.pendingRemote = { payload, sync };
       state.modal = { type: 'remote-unlock' };
       render();
@@ -539,13 +578,19 @@ async function pullRemote() {
     state.vault = remoteVault;
     state.record.remoteSha = remote.sha;
     await persistVault({ dirty: false });
+    const successfulAttempt = state.syncAttempt;
     state.modal = null;
     state.syncing = null;
+    state.syncAttempt = null;
+    state.syncLastError = null;
     render();
-    toast('已从远端拉取，保险库保持解锁');
+    toast(successfulAttempt > 1 ? `已从远端拉取（第 ${successfulAttempt} 次尝试成功），保险库保持解锁` : '已从远端拉取，保险库保持解锁');
   } catch (error) {
     state.syncing = null;
-    state.modal = { type: 'sync-result', title: '拉取失败', message: error.message || '无法从远端拉取保险库' };
+    const attempts = state.syncAttempt || MAX_SYNC_ATTEMPTS;
+    state.syncAttempt = null;
+    state.syncLastError = null;
+    state.modal = { type: 'sync-result', title: '拉取失败', message: `已尝试 ${attempts} 次。${error.message || '无法从远端拉取保险库'}` };
     render();
   }
 }
@@ -554,20 +599,28 @@ async function pushRemote() {
   const sync = state.vault.sync;
   if (!state.record.remoteSha && !confirm('将把本机保险库作为私有仓库的初始内容。若远端已有密文，它将被覆盖。是否继续？')) return;
   state.syncing = 'push';
+  state.syncAttempt = 1;
+  state.syncLastError = null;
   render();
   try {
     const record = { ...state.record, remoteSha: undefined, dirty: false };
-    const result = await putRemoteWithRetry(sync, record);
+    const result = await withSyncRetry(() => putRemoteOnce(sync, record));
     state.record.remoteSha = result.content.sha;
     state.record.dirty = false;
+    const successfulAttempt = state.syncAttempt;
     await dbPut(state.record);
     state.syncing = null;
+    state.syncAttempt = null;
+    state.syncLastError = null;
     state.modal = null;
     render();
-    toast('已推送加密保险库');
+    toast(successfulAttempt > 1 ? `已推送加密保险库（第 ${successfulAttempt} 次尝试成功）` : '已推送加密保险库');
   } catch (error) {
     state.syncing = null;
-    state.modal = { type: 'sync-result', title: '推送失败', message: error.message || '无法推送保险库到远端' };
+    const attempts = state.syncAttempt || MAX_SYNC_ATTEMPTS;
+    state.syncAttempt = null;
+    state.syncLastError = null;
+    state.modal = { type: 'sync-result', title: '推送失败', message: `已尝试 ${attempts} 次。${error.message || '无法推送保险库到远端'}` };
     render();
   }
 }

@@ -183,6 +183,7 @@ button.category-row:hover { background: var(--surface-hover); }
 .toast { min-width: 180px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: var(--shadow); color: var(--text); text-align: center; }
 .sync-result { display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--line)); border-radius: 6px; background: var(--danger-soft); color: var(--danger); }
 .sync-result svg { width: 19px; flex: none; }
+.sync-retry-note { margin: 12px 0 0; color: var(--warning); font-size: 12px; }
 .is-spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
