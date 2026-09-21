@@ -484,10 +484,30 @@ function githubHeaders(token) {
 async function remoteRequest(method, sync, body) {
   const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
   const url = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}/contents/${encodedPath}${method === 'GET' ? `?ref=${encodeURIComponent(sync.branch)}` : ''}`;
-  const response = await fetch(url, { method, headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const response = await fetch(url, { method, cache: 'no-store', headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
   if (response.status === 404 && method === 'GET') return null;
-  if (!response.ok) throw new Error(`GitHub 返回 ${response.status}`);
-  return response.json();
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
+    error.status = response.status;
+    throw error;
+  }
+  return result;
+}
+
+async function putRemoteWithRetry(sync, record) {
+  const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
+  let remote = await remoteRequest('GET', sync);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
+    } catch (error) {
+      if (error.status !== 409 || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      remote = await remoteRequest('GET', sync);
+    }
+  }
+  throw new Error('无法完成远端推送');
 }
 
 async function pullRemote() {
@@ -536,10 +556,8 @@ async function pushRemote() {
   state.syncing = 'push';
   render();
   try {
-    const remote = await remoteRequest('GET', sync);
     const record = { ...state.record, remoteSha: undefined, dirty: false };
-    const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
-    const result = await remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
+    const result = await putRemoteWithRetry(sync, record);
     state.record.remoteSha = result.content.sha;
     state.record.dirty = false;
     await dbPut(state.record);
