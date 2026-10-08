@@ -1,4 +1,4 @@
-const CACHE_NAME = 'passwmana-static-v11';
+const CACHE_NAME = 'passwmana-static-v12';
 const APP_SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -11,6 +11,8 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
+  // Authenticated GitHub requests must always reach the network, never the shell cache.
+  if (new URL(event.request.url).origin !== self.location.origin) return;
   event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
     if (new URL(event.request.url).origin === self.location.origin) {
       const copy = response.clone();

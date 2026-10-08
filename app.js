@@ -3,6 +3,9 @@ const STORE_NAME = 'vault';
 const RECORD_KEY = 'primary';
 const PBKDF2_ITERATIONS = 600000;
 const MAX_SYNC_ATTEMPTS = 3;
+const SYNC_DEBOUNCE_MS = 2000;
+const SYNC_POLL_MS = 60000;
+const SYNC_TIMEOUT_MS = 20000;
 const DEFAULT_CATEGORIES = ['工作', '个人', '金融'];
 
 const app = document.getElementById('app');
@@ -23,9 +26,20 @@ const state = {
   syncAttempt: null,
   syncLastError: null,
   pendingRemote: null,
-  autoPullStarted: false,
+  session: 0,
+  vaultRevision: 0,
+  syncPromise: null,
+  syncController: null,
+  syncTimer: null,
+  syncPollTimer: null,
+  syncRetryCount: 0,
+  syncRetryAt: 0,
+  syncBlocked: false,
   drawerOpen: false,
   timer: null,
+  lastActivityAt: Date.now(),
+  localSaveError: null,
+  releaseVaultLock: null,
 };
 
 function escapeHtml(value = '') {
@@ -74,7 +88,7 @@ async function dbGet() {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const request = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(RECORD_KEY);
-    request.onsuccess = () => resolve(request.result || null);
+    request.onsuccess = () => { db.close(); resolve(request.result || null); };
     request.onerror = () => reject(request.error);
   });
 }
@@ -82,10 +96,19 @@ async function dbGet() {
 async function dbPut(record) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const request = db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME).put(record, RECORD_KEY);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    transaction.objectStore(STORE_NAME).put(record, RECORD_KEY);
+    transaction.oncomplete = () => { db.close(); resolve(); };
+    transaction.onabort = transaction.onerror = () => { db.close(); reject(transaction.error); };
   });
+}
+
+let storageQueue = Promise.resolve();
+
+function queueStorage(operation) {
+    const result = storageQueue.then(operation);
+    storageQueue = result.catch(() => {});
+    return result;
 }
 
 async function deriveKey(secret, salt) {
@@ -120,7 +143,7 @@ function defaultVault() {
     trash: [],
     categories: DEFAULT_CATEGORIES,
     preferences: { lockMinutes: 5 },
-    sync: { owner: '', repo: '', branch: 'main', path: 'passwmana.vault', token: '' },
+    sync: { owner: '', repo: '', branch: 'main', path: 'passwmana.vault', token: '', automatic: true },
   };
 }
 
@@ -156,27 +179,63 @@ async function unlockWithMaster(record, masterPassword) {
 }
 
 async function persistVault({ dirty = true } = {}) {
-  state.record.encryptedVault = await encryptText(JSON.stringify(state.vault), state.vaultKey);
-  state.record.updatedAt = new Date().toISOString();
-  state.record.dirty = dirty;
-  await dbPut(state.record);
+    const record = state.record;
+    const vaultKey = state.vaultKey;
+    const snapshot = JSON.stringify(state.vault);
+    const updatedAt = new Date().toISOString();
+    state.vaultRevision += 1;
+    if (dirty) record.dirty = true;
+    try {
+        await queueStorage(async () => {
+            record.encryptedVault = await encryptText(snapshot, vaultKey);
+            record.updatedAt = updatedAt;
+            await dbPut(record);
+        });
+        state.localSaveError = null;
+    } catch (error) {
+        state.localSaveError = error;
+        throw error;
+    }
+    if (dirty) scheduleAutoSync();
 }
 
-function resetLockTimer() {
+function resetLockTimer({ activity = true } = {}) {
   if (!state.vaultKey) return;
+  if (activity) state.lastActivityAt = Date.now();
   clearTimeout(state.timer);
   const minutes = Number(state.vault.preferences?.lockMinutes ?? 5);
-  if (minutes > 0) state.timer = setTimeout(lockVault, minutes * 60 * 1000);
+  if (minutes > 0) state.timer = setTimeout(lockVault, Math.max(0, minutes * 60 * 1000 - (Date.now() - state.lastActivityAt)));
+}
+
+async function acquireVaultLock() {
+    if (!navigator.locks || state.releaseVaultLock) return;
+    let report;
+    const acquired = new Promise((resolve) => { report = resolve; });
+    navigator.locks.request('passwmana-unlocked', { ifAvailable: true }, async (lock) => {
+        if (!lock) { report(false); return; }
+        const released = new Promise((resolve) => { state.releaseVaultLock = resolve; });
+        report(true);
+        await released;
+    }).catch(() => report(false));
+    if (!await acquired) throw new Error('保险库已在另一个标签页解锁，请先锁定该页面');
+}
+
+function releaseVaultLock() {
+    const release = state.releaseVaultLock;
+    state.releaseVaultLock = null;
+    // Finish captured encrypted saves before another tab reads the shared database.
+    if (release) storageQueue.finally(release);
 }
 
 function lockVault() {
   clearTimeout(state.timer);
+  stopSyncSession();
+  releaseVaultLock();
   state.vaultKey = null;
   state.rawVaultKey = null;
   state.vault = null;
   state.modal = null;
   state.syncAutomatic = false;
-  state.autoPullStarted = false;
   state.pendingRemote = null;
   state.drawerOpen = false;
   render();
@@ -294,8 +353,46 @@ function updateVaultList() {
   drawIcons();
 }
 
+function syncStatus() {
+    if (state.localSaveError) return { label: '本地保存失败', detail: '无法保存到本机，请保留页面并检查浏览器存储空间', status: 'error', icon: 'circle-alert' };
+    if (!syncConfigured()) return { label: '仅本地保存', detail: '配置私有仓库后即可启用后台同步', status: 'local', icon: 'hard-drive' };
+    if (state.syncing) return { label: '正在同步', detail: '正在后台同步加密保险库，可以继续使用', status: 'syncing', icon: 'refresh-cw' };
+    if (!state.record.remoteSha) return { label: '等待首次连接', detail: '请选择从远端导入或初始化远端，完成后自动同步', status: 'pending', icon: 'cloud-off' };
+    if (navigator.onLine === false) return { label: '离线保存', detail: '改动已在本地加密保存，联网并解锁后自动同步', status: 'pending', icon: 'cloud-off' };
+    if (state.syncLastError) return { label: state.syncBlocked ? '需要处理同步' : '等待重试', detail: state.syncLastError.message, status: 'error', icon: 'circle-alert' };
+    if (state.record.dirty) return { label: '等待同步', detail: state.vault.sync.automatic === false ? '改动已在本地保存，请手动同步' : '改动已在本地保存，即将自动同步', status: 'pending', icon: 'cloud-upload' };
+    return { label: '已同步', detail: state.record.lastSyncedAt ? `最近同步：${new Date(state.record.lastSyncedAt).toLocaleString('zh-CN')}` : '本地保险库已与私有仓库同步', status: 'synced', icon: 'cloud-check' };
+}
+
+function refreshSyncStatus() {
+    if (!state.vaultKey) return;
+    const status = syncStatus();
+    app.querySelectorAll('[data-sync-label]').forEach((node) => { node.textContent = status.label; });
+    app.querySelectorAll('[data-sync-detail]').forEach((node) => { node.textContent = status.detail; });
+    app.querySelectorAll('[data-sync-status]').forEach((node) => { node.dataset.syncStatus = status.status; node.title = status.detail; });
+    app.querySelectorAll('[data-sync-icon]').forEach((node) => { node.innerHTML = icon(status.icon, state.syncing ? 'is-spinning' : ''); });
+    app.querySelectorAll('[data-action="pull-remote"], [data-action="push-remote"]').forEach((node) => { node.disabled = Boolean(state.syncing); });
+    drawIcons();
+}
+
+function refreshVaultViews() {
+    updateVaultList();
+    const filter = app.querySelector('[data-input="category"]');
+    if (filter && filter !== document.activeElement) {
+        filter.innerHTML = `<option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('')}`;
+        filter.value = state.category;
+    }
+    // Background updates must leave open forms, their values and focus intact.
+    for (const [panel, template] of Object.entries({ sync: renderSyncSettings, security: renderSecuritySettings, categories: renderCategoriesSettings, trash: renderTrashSettings })) {
+        const node = app.querySelector(`.settings-panel[data-panel="${panel}"]`);
+        if (node && !node.contains(document.activeElement)) node.outerHTML = template();
+    }
+    refreshSyncStatus();
+}
+
 function renderVault() {
-  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="notice"><div class="notice-copy">${icon(state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${state.record.dirty ? '本地改动尚未同步到私有仓库' : '本地保险库已与私有仓库同步'}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}手动同步</button></div><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索站点、账户或分类" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
+  const status = syncStatus();
+  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}同步详情</button></div><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索站点、账户或分类" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
 }
 
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: 'Appearance', categories: '分类', trash: '回收站' };
@@ -307,7 +404,7 @@ function settingsNavigation() {
 function renderSyncSettings() {
   const sync = state.vault.sync;
   const repo = sync.owner && sync.repo ? `${sync.owner} / ${sync.repo}` : '尚未配置私有仓库';
-  return `<section class="settings-panel ${state.settingPanel === 'sync' ? 'active' : ''}" data-panel="sync"><h2>同步与备份</h2><p class="panel-intro">保险库始终以加密形式保存。同步仅在你主动操作时进行。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>私有仓库</strong><span>${escapeHtml(repo)}</span></div><button class="secondary-button" data-action="open-sync-config">配置</button></div><div class="setting-row"><div class="setting-copy"><strong>最近同步</strong><span>${state.record.remoteSha ? `已连接，${state.record.dirty ? '有本地改动' : '没有待同步改动'}` : '尚未连接远端'}</span></div><button class="secondary-button" data-action="open-sync">同步</button></div><div class="setting-row"><div class="setting-copy"><strong>加密备份</strong><span>导出当前保险库为 .passwmana 文件</span></div><button class="secondary-button" data-action="export-backup">${icon('download')}导出</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复加密备份</strong><span>使用 .passwmana 文件替换本机保险库</span></div><button class="secondary-button" data-action="import-backup">${icon('upload')}恢复</button></div><div class="setting-row"><div class="setting-copy"><strong>迁移旧版备份</strong><span>从旧版明文 JSON 合并条目与分类</span></div><button class="secondary-button" data-action="import-legacy">${icon('file-input')}迁移</button></div></div></section>`;
+  return `<section class="settings-panel ${state.settingPanel === 'sync' ? 'active' : ''}" data-panel="sync"><h2>同步与备份</h2><p class="panel-intro">首次连接后，解锁、保存改动和恢复联网时自动同步。页面打开且已解锁时，每分钟检查远端更新。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>私有仓库</strong><span>${escapeHtml(repo)}</span></div><button class="secondary-button" data-action="open-sync-config">配置</button></div><div class="setting-row"><div class="setting-copy"><strong>后台自动同步</strong><span>保存后约 2 秒同步；锁定或关闭页面时暂停</span></div><button class="secondary-button" data-action="toggle-auto-sync" aria-pressed="${sync.automatic !== false}">${sync.automatic === false ? '已关闭' : '已开启'}</button></div><div class="setting-row"><div class="setting-copy"><strong>同步状态</strong><span data-sync-detail>${escapeHtml(syncStatus().detail)}</span></div><button class="secondary-button" data-action="open-sync">详情</button></div><div class="setting-row"><div class="setting-copy"><strong>加密备份</strong><span>导出当前保险库为 .passwmana 文件</span></div><button class="secondary-button" data-action="export-backup">${icon('download')}导出</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复加密备份</strong><span>使用 .passwmana 文件替换本机保险库</span></div><button class="secondary-button" data-action="import-backup">${icon('upload')}恢复</button></div><div class="setting-row"><div class="setting-copy"><strong>迁移旧版备份</strong><span>从旧版明文 JSON 合并条目与分类</span></div><button class="secondary-button" data-action="import-legacy">${icon('file-input')}迁移</button></div></div></section>`;
 }
 
 function renderSecuritySettings() {
@@ -352,16 +449,12 @@ function modalTemplate() {
     return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>${escapeHtml(entry.title)}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><dl><div class="detail-row"><dt>账户</dt><dd>${escapeHtml(entry.username)}</dd></div><div class="detail-row"><dt>网址</dt><dd>${escapeHtml(entry.url || '未设置')}</dd></div><div class="detail-row"><dt>分类</dt><dd>${escapeHtml(entry.category)}</dd></div><div class="detail-row"><dt>更新时间</dt><dd>${new Date(entry.updatedAt).toLocaleString('zh-CN')}</dd></div></dl><div class="secret"><span class="secret-value">${password}</span><button class="icon-button" data-action="reveal-password" title="${state.modal.revealed ? '隐藏密码' : '显示密码'}" aria-label="显示或隐藏密码">${icon(state.modal.revealed ? 'eye-off' : 'eye')}</button></div></div><footer class="modal-foot"><button class="secondary-button" data-action="delete-entry" data-id="${entry.id}">${icon('trash-2')}删除</button><button class="secondary-button" data-action="open-edit" data-id="${entry.id}">${icon('pencil')}编辑</button><button class="primary-button" data-action="copy-password" data-id="${entry.id}">${icon('copy')}复制密码</button></footer></section></div>`;
   }
   if (state.modal.type === 'sync') {
-    const configured = state.vault.sync.owner && state.vault.sync.repo && state.vault.sync.token;
+    const configured = syncConfigured();
     const firstConnection = !state.record.remoteSha;
-    const isPulling = state.syncing === 'pull';
-    const isPushing = state.syncing === 'push';
     const disabled = state.syncing ? 'disabled' : '';
-    const attemptLabel = state.syncing ? `（第 ${state.syncAttempt || 1}/${MAX_SYNC_ATTEMPTS} 次）` : '';
-    const status = firstConnection ? '首次连接：建议先从远端导入保险库' : state.record.dirty ? '本地有待同步改动' : '没有待同步改动';
-    const note = firstConnection ? '若私有仓库已有保险库，请选择“从远端导入”。只有仓库尚无密文时才选择“初始化远端”。' : '单用户模式下，拉取直接采用远端版本，推送直接更新远端版本。';
-    const retryNote = state.syncLastError ? `<p class="sync-retry-note">上次尝试失败：${escapeHtml(state.syncLastError.message)}</p>` : '';
-    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>${state.syncAutomatic ? '登录后自动同步' : '手动同步'}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭" ${disabled}>${icon('x')}</button></header><div class="modal-body"><div class="sync-state">${icon(firstConnection || state.record.dirty ? 'cloud-off' : 'cloud-check')}<span>${status}</span></div><p class="panel-intro">同步内容始终以加密形式保存到私有仓库。</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${isPulling ? `${icon('loader-circle', 'is-spinning')}正在拉取${attemptLabel}...` : `${icon('download')}${firstConnection ? '从远端导入' : '从远端拉取'}`}</button><button class="primary-button" data-action="push-remote" ${disabled}>${isPushing ? `${icon('loader-circle', 'is-spinning')}正在推送${attemptLabel}...` : `${icon('upload')}${firstConnection ? '初始化远端' : '推送本地改动'}`}</button></div>${retryNote}<p class="dialog-note">${state.syncAutomatic ? '这是本次登录后的自动拉取，完成后会继续进入密码库。' : note}</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
+    const status = syncStatus();
+    const note = firstConnection ? '已有保险库请选择“从远端导入”；空仓库请选择“初始化远端”。导入会替换本地条目，请先备份。' : '立即同步会合并不同条目的改动，同一条目冲突时保留本地数据并停止上传。“采用远端版本”会替换本地条目，请先导出备份。';
+    return `<div class="modal-layer open" data-modal-layer><section class="modal"><header class="modal-head"><h2>同步详情</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-state" data-sync-status="${status.status}"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-label>${escapeHtml(status.label)}</span></div><p class="panel-intro" data-sync-detail>${escapeHtml(status.detail)}</p>${configured ? `<div class="sync-actions"><button class="secondary-button" data-action="pull-remote" ${disabled}>${icon('download')}${firstConnection ? '从远端导入' : '采用远端版本'}</button><button class="primary-button" data-action="push-remote" ${disabled}>${icon('refresh-cw')}${firstConnection ? '初始化远端' : '立即同步'}</button></div><button class="secondary-button sync-backup" data-action="export-backup">${icon('download')}导出加密备份</button><p class="dialog-note">${note}</p>` : `<button class="primary-button" data-action="open-sync-config">配置私有仓库</button>`}</div></section></div>`;
   }
   if (state.modal.type === 'sync-result') {
     return `<div class="modal-layer open" data-modal-layer><section class="modal" role="alertdialog" aria-labelledby="sync-result-title"><header class="modal-head"><h2 id="sync-result-title">${escapeHtml(state.modal.title)}</h2><button class="icon-button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></header><div class="modal-body"><div class="sync-result">${icon('circle-alert')}<span>${escapeHtml(state.modal.message)}</span></div></div><footer class="modal-foot"><button class="primary-button" data-action="close-modal">知道了</button></footer></section></div>`;
@@ -385,7 +478,7 @@ function modalTemplate() {
 function renderApp() {
   const title = state.view === 'vault' ? '密码库' : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
   const nav = `<nav class="main-nav"><button class="nav-link ${state.view === 'vault' ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}密码库</button><button class="nav-link ${state.view === 'settings' ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}设置</button></nav>`;
-  app.innerHTML = `<div class="app-shell"><aside class="side-nav"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="打开导航" aria-label="打开导航">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync"><span class="sync-dot"></span><span>${state.record.dirty ? '有本地改动' : '已同步'}</span>${icon('refresh-cw')}</button></div></header><div class="page">${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap"></div>`;
+  app.innerHTML = `<div class="app-shell"><aside class="side-nav"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="打开导航" aria-label="打开导航">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync" data-sync-status="${syncStatus().status}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(syncStatus().label)}</span>${icon('refresh-cw')}</button></div></header><div class="page">${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap"></div>`;
   queueMicrotask(drawIcons);
 }
 
@@ -402,14 +495,18 @@ function render() {
     app.innerHTML = renderUnlock();
   } else {
     renderApp();
-    resetLockTimer();
   }
   queueMicrotask(drawIcons);
 }
 
 function toast(message) {
-  const container = document.getElementById('toast-wrap');
-  if (!container) return;
+  let container = document.getElementById('toast-wrap');
+  if (!container) {
+    container = document.createElement('div');
+    container.className = 'toast-wrap';
+    container.id = 'toast-wrap';
+    app.append(container);
+  }
   const node = document.createElement('div');
   node.className = 'toast';
   node.textContent = message;
@@ -424,6 +521,7 @@ async function copyText(value, message = '已复制') {
 }
 
 async function downloadBackup() {
+  await storageQueue;
   const data = JSON.stringify({ exportedAt: new Date().toISOString(), record: state.record }, null, 2);
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
@@ -445,11 +543,19 @@ async function importBackup() {
       const record = data.record || data;
       if (record.format !== 'passwmana-v1' || !record.encryptedVault || !record.wrappedVaultKey) throw new Error('格式不正确');
       if (!confirm('恢复会覆盖此设备的本地保险库。是否继续？')) return;
-      await dbPut(record);
+      stopSyncSession();
+      delete record.syncBase;
+      delete record.lastSyncedAt;
+      record.remoteSha = null;
+      record.dirty = true;
+      await queueStorage(() => dbPut(record));
       state.record = record;
       state.vault = null;
       state.vaultKey = null;
       state.rawVaultKey = null;
+      state.pendingRemote = null;
+      state.localSaveError = null;
+      releaseVaultLock();
       state.modal = null;
       render();
       toast('备份已恢复，请解锁');
@@ -471,7 +577,7 @@ async function importLegacyBackup() {
         throw new Error('这是新版加密备份，请使用“恢复加密备份”');
       }
       if (!Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
-      const confirmed = confirm('旧版 JSON 包含明文密码。文件只会在当前浏览器内读取并立即加密，不会上传。确认迁移并合并到当前保险库？');
+      const confirmed = confirm('旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？');
       if (!confirmed) return;
       const converted = convertLegacyBackup(data, state.vault);
       state.vault.entries = converted.entries;
@@ -490,177 +596,411 @@ function githubHeaders(token) {
   return { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28' };
 }
 
-async function remoteRequest(method, sync, body) {
-  const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
-  const url = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}/contents/${encodedPath}${method === 'GET' ? `?ref=${encodeURIComponent(sync.branch)}` : ''}`;
-  const response = await fetch(url, { method, cache: 'no-store', headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
-  if (response.status === 404 && method === 'GET') return null;
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
-    error.status = response.status;
-    throw error;
-  }
-  return result;
+function syncError(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    error.retryable = false;
+    return error;
+}
+
+function syncConfigured(sync = state.vault?.sync) {
+    return Boolean(sync?.owner && sync.repo && sync.branch && sync.path && sync.token);
+}
+
+function stopSyncSession() {
+    state.session += 1;
+    state.syncController?.abort();
+    clearTimeout(state.syncTimer);
+    clearInterval(state.syncPollTimer);
+    state.syncController = null;
+    state.syncPromise = null;
+    state.syncing = null;
+    state.syncAttempt = null;
+    state.syncBlocked = false;
+    state.syncRetryCount = 0;
+    state.syncRetryAt = 0;
+    state.verifiedSyncTarget = null;
+    state.pendingRemote = null;
+}
+
+function startSyncSession() {
+    stopSyncSession();
+    state.syncLastError = null;
+    if (!state.vaultKey) return;
+    state.syncPollTimer = setInterval(() => scheduleAutoSync(0), SYNC_POLL_MS);
+    scheduleAutoSync(0);
+}
+
+function scheduleAutoSync(delay = SYNC_DEBOUNCE_MS) {
+    if (!state.vaultKey || !syncConfigured() || state.vault.sync.automatic === false
+        || !state.record.remoteSha || state.syncBlocked) return;
+    clearTimeout(state.syncTimer);
+    if (navigator.onLine === false || document.visibilityState === 'hidden') return;
+    const wait = Math.max(delay, state.syncRetryAt - Date.now(), 0);
+    state.syncTimer = setTimeout(() => { void synchronize({ automatic: true }); }, wait);
+}
+
+function assertSyncSession(session) {
+    if (session !== state.session || !state.vaultKey) throw new DOMException('同步已取消', 'AbortError');
+}
+
+async function remoteRequest(method, sync, body, { repository = false } = {}) {
+    const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
+    const root = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}`;
+    const url = repository ? root : `${root}/contents/${encodedPath}${method === 'GET' ? `?ref=${encodeURIComponent(sync.branch)}` : ''}`;
+    const controller = new AbortController();
+    const sessionSignal = state.syncController?.signal;
+    const abort = () => controller.abort();
+    sessionSignal?.addEventListener('abort', abort, { once: true });
+    if (sessionSignal?.aborted) controller.abort();
+    const timer = setTimeout(abort, SYNC_TIMEOUT_MS);
+    try {
+        const response = await fetch(url, {
+            method, cache: 'no-store', signal: controller.signal,
+            headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        if (response.status === 404 && method === 'GET' && !repository) return null;
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
+            error.status = response.status;
+            const retryAfter = Number(response.headers.get('retry-after'));
+            const rateReset = Number(response.headers.get('x-ratelimit-reset')) * 1000;
+            if (response.status === 429 || (response.status === 403 && (retryAfter > 0
+                || response.headers.get('x-ratelimit-remaining') === '0' || /rate limit/i.test(result.message || '')))) {
+                error.retryAfterMs = Math.max(retryAfter * 1000, rateReset - Date.now(), 60000);
+            }
+            throw error;
+        }
+        return result;
+    } catch (error) {
+        if (controller.signal.aborted && !sessionSignal?.aborted) {
+            const timeout = new Error('连接 GitHub 超时，将稍后重试');
+            timeout.status = 408;
+            throw timeout;
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        sessionSignal?.removeEventListener('abort', abort);
+    }
 }
 
 function isRetryableSyncError(error) {
-  if (error.retryable === false) return false;
-  if (!error.status) return true;
-  return [408, 409, 425, 429].includes(error.status) || error.status >= 500;
+    if (error.retryable === false || error.name === 'AbortError') return false;
+    return Boolean(error.retryAfterMs) || !error.status || [408, 409, 425, 429].includes(error.status) || error.status >= 500;
 }
 
-async function withSyncRetry(operation) {
-  let lastError;
-  for (let attempt = 1; attempt <= MAX_SYNC_ATTEMPTS; attempt += 1) {
-    state.syncAttempt = attempt;
-    if (attempt > 1) {
-      render();
-      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt - 1)));
+async function withSyncRetry(operation, session = state.session) {
+    for (let attempt = 1; attempt <= MAX_SYNC_ATTEMPTS; attempt += 1) {
+        assertSyncSession(session);
+        state.syncAttempt = attempt;
+        refreshSyncStatus();
+        try {
+            return await operation();
+        } catch (error) {
+            assertSyncSession(session);
+            if (!isRetryableSyncError(error) || error.retryAfterMs || attempt === MAX_SYNC_ATTEMPTS) throw error;
+            state.syncLastError = error;
+            refreshSyncStatus();
+            await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+        }
     }
-    try {
-      return await operation(attempt);
-    } catch (error) {
-      lastError = error;
-      if (!isRetryableSyncError(error) || attempt === MAX_SYNC_ATTEMPTS) throw error;
-      state.syncLastError = error;
-      state.syncAttempt = attempt + 1;
-      render();
-      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+}
+
+function comparable(value) {
+    if (Array.isArray(value)) return value.map(comparable);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().filter((key) => key !== 'updatedAt')
+            .map((key) => [key, comparable(value[key])]));
     }
-  }
-  throw lastError || new Error('同步失败');
+    return value;
 }
 
-async function putRemoteOnce(sync, record) {
-  const content = bytesToBase64(new TextEncoder().encode(JSON.stringify(record)));
-  const remote = await remoteRequest('GET', sync);
-  return remoteRequest('PUT', sync, { message: 'Update encrypted PasswMana vault', content, branch: sync.branch, ...(remote ? { sha: remote.sha } : {}) });
+function sameValue(left, right) {
+    return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right));
 }
 
-async function pullRemote({ automatic = false } = {}) {
-  const sync = state.vault.sync;
-  if (!automatic && !state.record.remoteSha && !confirm('这是首次连接。将从私有仓库导入保险库；原有本地条目不会保留。是否继续？')) return;
-  state.syncing = 'pull';
-  state.syncAutomatic = automatic;
-  state.syncAttempt = 1;
-  state.syncLastError = null;
-  render();
-  try {
-    const { remote, payload } = await withSyncRetry(async () => {
-      const nextRemote = await remoteRequest('GET', sync);
-      if (!nextRemote) {
-        const error = new Error('远端尚未找到保险库文件');
-        error.status = 404;
-        throw error;
-      }
-      const nextPayload = JSON.parse(new TextDecoder().decode(base64ToBytes(nextRemote.content.replace(/\n/g, ''))));
-      if (nextPayload.format !== 'passwmana-v1') {
-        const error = new Error('远端文件格式不正确');
-        error.retryable = false;
-        throw error;
-      }
-      return { remote: nextRemote, payload: nextPayload };
-    });
+function mergeValue(base, local, remote) {
+    if (sameValue(local, remote) || sameValue(remote, base)) return local;
+    if (sameValue(local, base)) return remote;
+    throw syncError('两台设备修改了同一条目或设置。已保留本地改动，请导出备份后处理冲突。', 'conflict');
+}
 
-    // A usual pull is another revision of this vault, so keep device-local key wrappers and sync credentials.
-    let remoteVault;
+function vaultItems(vault) {
+    return new Map([
+        ...vault.entries.map((entry) => [entry.id, { location: 'entries', entry }]),
+        ...vault.trash.map((entry) => [entry.id, { location: 'trash', entry }]),
+    ]);
+}
+
+function mergeVaults(base, local, remote) {
+    const baseItems = vaultItems(base);
+    const localItems = vaultItems(local);
+    const remoteItems = vaultItems(remote);
+    const merged = { ...local, entries: [], trash: [], categories: [], preferences: {} };
+    for (const id of new Set([...localItems.keys(), ...remoteItems.keys(), ...baseItems.keys()])) {
+        const item = mergeValue(baseItems.get(id), localItems.get(id), remoteItems.get(id));
+        if (item) merged[item.location].push(structuredClone(item.entry));
+    }
+    for (const category of new Set([...local.categories, ...remote.categories, ...base.categories])) {
+        if (mergeValue(base.categories.includes(category), local.categories.includes(category), remote.categories.includes(category))) {
+            merged.categories.push(category);
+        }
+    }
+    for (const entry of [...merged.entries, ...merged.trash]) {
+        if (entry.category && !merged.categories.includes(entry.category)) merged.categories.push(entry.category);
+    }
+    for (const key of new Set([...Object.keys(base.preferences || {}), ...Object.keys(local.preferences || {}), ...Object.keys(remote.preferences || {})])) {
+        const value = mergeValue(base.preferences?.[key], local.preferences?.[key], remote.preferences?.[key]);
+        if (value !== undefined) merged.preferences[key] = value;
+    }
+    return merged;
+}
+
+function validateVault(vault) {
+    if (!vault || !Array.isArray(vault.entries) || !Array.isArray(vault.trash)
+        || !Array.isArray(vault.categories) || !vault.categories.every((category) => typeof category === 'string')
+        || !vault.preferences || typeof vault.preferences !== 'object' || Array.isArray(vault.preferences)
+        || (vault.preferences.lockMinutes !== undefined && (!Number.isFinite(Number(vault.preferences.lockMinutes)) || Number(vault.preferences.lockMinutes) < 0))) {
+        throw syncError('远端保险库结构不正确，已保留本地数据', 'format');
+    }
+    const ids = new Set();
+    for (const entry of [...vault.entries, ...vault.trash]) {
+        if (!entry || typeof entry.id !== 'string' || !entry.id || ids.has(entry.id)
+            || typeof entry.title !== 'string' || typeof entry.password !== 'string') {
+            throw syncError('远端条目格式不正确，已保留本地数据', 'format');
+        }
+        ids.add(entry.id);
+    }
+    return vault;
+}
+
+function decodeRemote(remote) {
     try {
-      remoteVault = JSON.parse(await decryptText(payload.encryptedVault, state.vaultKey));
+        if (!remote.sha || typeof remote.content !== 'string') throw new Error();
+        const payload = JSON.parse(new TextDecoder().decode(base64ToBytes(remote.content.replace(/\s/g, ''))));
+        if (payload.format !== 'passwmana-v1' || !payload.encryptedVault?.iv || !payload.encryptedVault?.data
+            || !payload.wrappedVaultKey || !payload.masterSalt || !payload.recoveryWrappedVaultKey || !payload.recoverySalt) throw new Error();
+        return payload;
     } catch {
-      payload.remoteSha = remote.sha;
-      payload.dirty = false;
-      state.syncing = null;
-      state.syncAutomatic = false;
-      state.syncAttempt = null;
-      state.syncLastError = null;
-      state.pendingRemote = { payload, sync };
-      state.modal = { type: 'remote-unlock' };
-      render();
-      return;
+        throw syncError('远端文件格式不正确，已保留本地数据', 'format');
     }
-
-    remoteVault.sync = sync;
-    state.vault = remoteVault;
-    state.record.remoteSha = remote.sha;
-    await persistVault({ dirty: false });
-    const successfulAttempt = state.syncAttempt;
-    state.modal = null;
-    state.syncing = null;
-    state.syncAutomatic = false;
-    state.syncAttempt = null;
-    state.syncLastError = null;
-    render();
-    toast(successfulAttempt > 1 ? `已从远端拉取（第 ${successfulAttempt} 次尝试成功），保险库保持解锁` : '已从远端拉取，保险库保持解锁');
-  } catch (error) {
-    state.syncing = null;
-    state.syncAutomatic = false;
-    const attempts = state.syncAttempt || MAX_SYNC_ATTEMPTS;
-    state.syncAttempt = null;
-    state.syncLastError = null;
-    state.modal = { type: 'sync-result', title: '拉取失败', message: `已尝试 ${attempts} 次。${error.message || '无法从远端拉取保险库'}` };
-    render();
-  }
 }
 
-async function autoPullAfterUnlock() {
-  if (state.autoPullStarted || !state.vault) return;
-  state.autoPullStarted = true;
-  const sync = state.vault.sync;
-  const configured = sync?.owner && sync?.repo && sync?.branch && sync?.path && sync?.token;
-  if (!configured) return;
-  if (!state.record.remoteSha) {
-    toast('已登录。同步尚未完成首次连接，请在同步中选择“从远端导入”');
-    return;
-  }
-  if (state.record.dirty) {
-    toast('本地有待同步改动，已跳过登录自动拉取');
-    return;
-  }
-  state.modal = { type: 'sync' };
-  await pullRemote({ automatic: true });
+function remoteRecord(record) {
+    // Device sync bookkeeping and the encrypted merge base never travel to GitHub.
+    const { remoteSha, syncBase, dirty, lastSyncedAt, ...payload } = record;
+    return payload;
+}
+
+function localRevisionChanged(revision) {
+    if (revision !== state.vaultRevision) {
+        const error = new Error('本地保存了新改动，正在重新同步');
+        error.status = 409;
+        throw error;
+    }
+}
+
+function assertLocalSaved() {
+    if (state.localSaveError) throw syncError('本地改动尚未成功保存，已暂停同步。请检查浏览器存储空间并重新保存。', 'storage');
+}
+
+async function applyRemoteVault(vault, payload, sha, dirty, revision, session) {
+    await queueStorage(async () => {
+        assertSyncSession(session);
+        localRevisionChanged(revision);
+        assertLocalSaved();
+        const encryptedVault = await encryptText(JSON.stringify(vault), state.vaultKey);
+        assertSyncSession(session);
+        localRevisionChanged(revision);
+        state.vault = vault;
+        state.vaultRevision += 1;
+        Object.assign(state.record, { encryptedVault, remoteSha: sha, syncBase: payload.encryptedVault, dirty, updatedAt: new Date().toISOString() });
+        await dbPut(state.record);
+    });
+    assertSyncSession(session);
+    resetLockTimer({ activity: false });
+    refreshVaultViews();
+}
+
+async function synchronizeOnce(sync, mode, session) {
+    await storageQueue;
+    assertSyncSession(session);
+    assertLocalSaved();
+    const target = JSON.stringify(sync);
+    if (state.verifiedSyncTarget !== target) {
+        const repository = await remoteRequest('GET', sync, undefined, { repository: true });
+        assertSyncSession(session);
+        if (repository.private !== true) throw syncError('请选择私有仓库保存加密保险库', 'repository');
+        state.verifiedSyncTarget = target;
+    }
+    const remote = await remoteRequest('GET', sync);
+    assertSyncSession(session);
+    await storageQueue;
+    assertSyncSession(session);
+    assertLocalSaved();
+    const revision = state.vaultRevision;
+    if (!remote && (state.record.remoteSha || mode === 'pull')) {
+        throw syncError('远端保险库文件不存在或无权读取，请检查仓库、分支、路径和令牌权限', 'missing');
+    }
+    if (remote && !state.record.remoteSha && mode !== 'pull') {
+        throw syncError('远端已有保险库，请选择“从远端导入”。初始化不会覆盖现有文件。', 'unbound');
+    }
+    if (remote) {
+        const payload = decodeRemote(remote);
+        if (mode === 'pull' || remote.sha !== state.record.remoteSha) {
+            let remoteVault;
+            try {
+                remoteVault = JSON.parse(await decryptText(payload.encryptedVault, state.vaultKey));
+            } catch {
+                assertSyncSession(session);
+                localRevisionChanged(revision);
+                if (mode === 'pull' && !state.record.remoteSha) {
+                    state.pendingRemote = { payload: { ...remoteRecord(payload), remoteSha: remote.sha, syncBase: payload.encryptedVault, dirty: false }, sync, revision };
+                    state.modal = { type: 'remote-unlock' };
+                    return;
+                }
+                throw syncError('远端属于不同保险库或密文已损坏，已保留本地数据。请检查同步配置。', 'key');
+            }
+            assertSyncSession(session);
+            localRevisionChanged(revision);
+            validateVault(remoteVault);
+            remoteVault.sync = { ...state.vault.sync };
+            let merged = remoteVault;
+            const dirty = mode !== 'pull' && state.record.dirty;
+            if (dirty) {
+                if (!state.record.syncBase) throw syncError('旧版同步尚无合并基线，两端都有改动。请先导出备份，再处理冲突。', 'conflict');
+                let base;
+                try { base = validateVault(JSON.parse(await decryptText(state.record.syncBase, state.vaultKey))); }
+                catch { throw syncError('无法读取同步基线，已保留本地改动，请先导出备份', 'conflict'); }
+                assertSyncSession(session);
+                localRevisionChanged(revision);
+                merged = mergeVaults(base, state.vault, remoteVault);
+            }
+            await applyRemoteVault(merged, payload, remote.sha, dirty, revision, session);
+        } else if (!state.record.syncBase) {
+            await queueStorage(async () => {
+                assertSyncSession(session);
+                state.record.syncBase = payload.encryptedVault;
+                await dbPut(state.record);
+            });
+        }
+    }
+    if (mode === 'pull' || (!state.record.dirty && remote)) return;
+    await storageQueue;
+    assertSyncSession(session);
+    assertLocalSaved();
+    const uploadedRevision = state.vaultRevision;
+    const payload = structuredClone(remoteRecord(state.record));
+    state.syncing = 'push';
+    refreshSyncStatus();
+    // The SHA is the version read and merged above. A 409 restarts GET + merge, never a blind overwrite.
+    const result = await remoteRequest('PUT', sync, {
+        message: 'Update encrypted PasswMana vault', branch: sync.branch,
+        content: bytesToBase64(new TextEncoder().encode(JSON.stringify(payload))),
+        ...(remote ? { sha: remote.sha } : {}),
+    });
+    assertSyncSession(session);
+    if (!result.content?.sha) throw syncError('GitHub 未返回文件版本，请重新检查同步状态', 'format');
+    await queueStorage(async () => {
+        assertSyncSession(session);
+        state.record.remoteSha = result.content.sha;
+        state.record.syncBase = payload.encryptedVault;
+        state.record.dirty = state.vaultRevision !== uploadedRevision;
+        await dbPut(state.record);
+    });
+}
+
+async function synchronize({ automatic = false, mode = 'sync' } = {}) {
+    if (!state.vaultKey || !syncConfigured()) return;
+    if (state.syncPromise) return state.syncPromise;
+    if (automatic && (state.vault.sync.automatic === false || !state.record.remoteSha || state.syncBlocked
+        || navigator.onLine === false || document.visibilityState === 'hidden')) return;
+    if (automatic && Date.now() < state.syncRetryAt) { scheduleAutoSync(0); return; }
+    if (!automatic && mode === 'pull' && (!state.record.remoteSha || state.record.dirty)
+        && !confirm('从远端导入会替换本地条目。请先导出加密备份保存本地改动。是否继续？')) return;
+    if (!automatic && mode !== 'pull' && !state.record.remoteSha
+        && !confirm('将以本机保险库初始化远端。只有远端不存在密文文件时才会创建。是否继续？')) return;
+    const session = state.session;
+    const sync = { ...state.vault.sync };
+    state.syncController = new AbortController();
+    state.syncing = mode === 'pull' ? 'pull' : 'sync';
+    state.syncAutomatic = automatic;
+    state.syncLastError = null;
+    state.syncBlocked = false;
+    clearTimeout(state.syncTimer);
+    refreshSyncStatus();
+    const operation = (async () => {
+        try {
+            await withSyncRetry(() => synchronizeOnce(sync, mode, session), session);
+            assertSyncSession(session);
+            if (state.pendingRemote) return;
+            await queueStorage(async () => {
+                assertSyncSession(session);
+                state.record.lastSyncedAt = new Date().toISOString();
+                await dbPut(state.record);
+            });
+            state.syncLastError = null;
+            state.syncRetryCount = 0;
+            state.syncRetryAt = 0;
+            if (!automatic) {
+                if (state.modal?.type === 'sync') state.modal = null;
+                if (!state.modal || state.modal.type === 'sync') render();
+                toast(mode === 'pull' ? '已采用远端版本，保险库保持解锁' : '已同步加密保险库');
+            }
+        } catch (error) {
+            if (session !== state.session || error.name === 'AbortError') return;
+            state.syncLastError = error;
+            state.syncBlocked = !isRetryableSyncError(error);
+            state.syncRetryCount += 1;
+            state.syncRetryAt = Date.now() + Math.max(error.retryAfterMs || 0, Math.min(300000, 5000 * 2 ** Math.min(state.syncRetryCount, 6)));
+            if (!automatic && (!state.modal || state.modal.type === 'sync')) {
+                state.modal = { type: 'sync-result', title: '同步未完成', message: `${error.message} 本地数据仍保存在此设备。` };
+                render();
+            }
+        } finally {
+            if (session === state.session) {
+                state.syncing = null;
+                state.syncAttempt = null;
+                state.syncAutomatic = false;
+                state.syncPromise = null;
+                state.syncController = null;
+                if (state.pendingRemote) render();
+                refreshSyncStatus();
+                if (!state.syncBlocked && !state.pendingRemote && (state.record.dirty || state.syncLastError)) scheduleAutoSync();
+            }
+        }
+    })();
+    state.syncPromise = operation;
+    return operation;
+}
+
+async function pullRemote() {
+    return synchronize({ mode: 'pull' });
 }
 
 async function pushRemote() {
-  const sync = state.vault.sync;
-  if (!state.record.remoteSha && !confirm('将把本机保险库作为私有仓库的初始内容。若远端已有密文，它将被覆盖。是否继续？')) return;
-  state.syncing = 'push';
-  state.syncAutomatic = false;
-  state.syncAttempt = 1;
-  state.syncLastError = null;
-  render();
-  try {
-    const record = { ...state.record, remoteSha: undefined, dirty: false };
-    const result = await withSyncRetry(() => putRemoteOnce(sync, record));
-    state.record.remoteSha = result.content.sha;
-    state.record.dirty = false;
-    const successfulAttempt = state.syncAttempt;
-    await dbPut(state.record);
-    state.syncing = null;
-    state.syncAttempt = null;
-    state.syncLastError = null;
-    state.modal = null;
-    render();
-    toast(successfulAttempt > 1 ? `已推送加密保险库（第 ${successfulAttempt} 次尝试成功）` : '已推送加密保险库');
-  } catch (error) {
-    state.syncing = null;
-    const attempts = state.syncAttempt || MAX_SYNC_ATTEMPTS;
-    state.syncAttempt = null;
-    state.syncLastError = null;
-    state.modal = { type: 'sync-result', title: '推送失败', message: `已尝试 ${attempts} 次。${error.message || '无法推送保险库到远端'}` };
-    render();
-  }
+    return synchronize();
 }
 
 async function handleSubmit(event) {
   const form = event.target.closest('form[data-form]');
   if (!form) return;
   event.preventDefault();
+  if (form.dataset.submitting) return;
+  form.dataset.submitting = 'true';
+  const submitButton = form.querySelector('[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
   const values = new FormData(form);
   try {
     if (form.dataset.form === 'setup') {
       const password = values.get('password');
       if (password !== values.get('confirmPassword')) throw new Error('两次主密码不一致');
+      await acquireVaultLock();
+      const existing = await dbGet();
+      if (existing) { state.record = existing; releaseVaultLock(); render(); return; }
       const recoveryCode = formatRecoveryCode();
       const created = await createVault(password, recoveryCode);
       state.record = created.record;
@@ -670,31 +1010,47 @@ async function handleSubmit(event) {
       await dbPut(state.record);
       state.modal = { type: 'recovery-created', code: recoveryCode };
       render();
+      resetLockTimer();
       return;
     }
     if (form.dataset.form === 'unlock') {
-      const unlocked = await unlockWithMaster(state.record, values.get('password'));
+      await acquireVaultLock();
+      await storageQueue;
+      state.record = await dbGet();
+      const session = state.session;
+      const record = state.record;
+      const unlocked = await unlockWithMaster(record, values.get('password'));
+      if (session !== state.session || record !== state.record) return;
       state.vaultKey = unlocked.vaultKey;
       state.rawVaultKey = unlocked.rawVaultKey;
       state.vault = unlocked.vault;
       pruneTrash();
       render();
-      void autoPullAfterUnlock();
+      resetLockTimer();
+      startSyncSession();
       return;
     }
     if (form.dataset.form === 'remote-unlock') {
       const pending = state.pendingRemote;
       if (!pending) throw new Error('远端拉取会话已失效，请重新拉取');
+      const session = state.session;
       const unlocked = await unlockWithMaster(pending.payload, values.get('password'));
+      assertSyncSession(session);
+      localRevisionChanged(pending.revision);
+      validateVault(unlocked.vault);
       unlocked.vault.sync = pending.sync;
+      stopSyncSession();
       state.record = pending.payload;
       state.vaultKey = unlocked.vaultKey;
       state.rawVaultKey = unlocked.rawVaultKey;
       state.vault = unlocked.vault;
+      state.record.lastSyncedAt = new Date().toISOString();
       await persistVault({ dirty: false });
       state.pendingRemote = null;
       state.modal = null;
       render();
+      resetLockTimer();
+      startSyncSession();
       toast('已从远端拉取，保险库保持解锁');
       return;
     }
@@ -704,6 +1060,7 @@ async function handleSubmit(event) {
       if (!entry.title || !entry.username || !entry.password) throw new Error('请填写站点、账户和密码');
       if (form.dataset.form === 'edit-entry') {
         const index = state.vault.entries.findIndex((item) => item.id === state.modal.entry.id);
+        if (index < 0 || !sameValue(state.vault.entries[index], state.modal.entry)) throw new Error('此条目已在后台更新或删除，请关闭编辑窗口后重新打开');
         state.vault.entries[index] = { ...state.vault.entries[index], ...entry };
       } else {
         state.vault.entries.unshift({ ...entry, id: makeId(), createdAt: now });
@@ -715,21 +1072,38 @@ async function handleSubmit(event) {
       return;
     }
     if (form.dataset.form === 'sync-config') {
-      state.vault.sync = { owner: values.get('owner').trim(), repo: values.get('repo').trim(), branch: values.get('branch').trim(), path: values.get('path').trim(), token: values.get('token').trim() };
+      const previous = state.vault.sync;
+      const next = { owner: values.get('owner').trim(), repo: values.get('repo').trim(), branch: values.get('branch').trim(), path: values.get('path').trim().replace(/^\/+|\/+$/g, ''), token: values.get('token').trim(), automatic: previous.automatic !== false };
+      if (!syncConfigured(next)) throw new Error('请完整填写仓库、分支、路径与令牌');
+      const targetChanged = ['owner', 'repo', 'branch', 'path'].some((key) => previous[key] !== next[key]);
+      stopSyncSession();
+      state.vault.sync = next;
+      if (targetChanged) {
+        state.record.remoteSha = null;
+        delete state.record.syncBase;
+        delete state.record.lastSyncedAt;
+      }
       await persistVault();
       state.modal = null;
       render();
+      startSyncSession();
       toast('私有仓库配置已加密保存');
       return;
     }
     if (form.dataset.form === 'change-password') {
+      const session = state.session;
+      const record = state.record;
+      const rawVaultKey = state.rawVaultKey;
       if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
       const currentKey = await deriveKey(values.get('currentPassword'), state.record.masterSalt);
       await decryptText(state.record.wrappedVaultKey, currentKey);
       const newSalt = randomBase64(16);
       const newKey = await deriveKey(values.get('newPassword'), newSalt);
+      const wrappedVaultKey = await encryptText(rawVaultKey, newKey);
+      assertSyncSession(session);
+      if (record !== state.record) return;
       state.record.masterSalt = newSalt;
-      state.record.wrappedVaultKey = await encryptText(state.rawVaultKey, newKey);
+      state.record.wrappedVaultKey = wrappedVaultKey;
       await persistVault();
       state.modal = null;
       render();
@@ -737,21 +1111,28 @@ async function handleSubmit(event) {
       return;
     }
     if (form.dataset.form === 'recovery-reset') {
+      await storageQueue;
+      const session = state.session;
+      const record = state.record;
       if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
       const recoveryKey = await deriveKey(values.get('recoveryCode').trim(), state.record.recoverySalt);
       const rawVaultKey = await decryptText(state.record.recoveryWrappedVaultKey, recoveryKey);
       const masterSalt = randomBase64(16);
       const masterKey = await deriveKey(values.get('newPassword'), masterSalt);
+      const wrappedVaultKey = await encryptText(rawVaultKey, masterKey);
+      if (session !== state.session || record !== state.record) return;
       state.record.masterSalt = masterSalt;
-      state.record.wrappedVaultKey = await encryptText(rawVaultKey, masterKey);
+      state.record.wrappedVaultKey = wrappedVaultKey;
       state.record.updatedAt = new Date().toISOString();
-      await dbPut(state.record);
+      state.record.dirty = true;
+      await queueStorage(() => dbPut(state.record));
       state.modal = null;
       render();
       toast('主密码已重设');
     }
   } catch (error) {
-    const friendlyError = form.dataset.form === 'unlock'
+    if (!state.vaultKey) releaseVaultLock();
+    const friendlyError = form.dataset.form === 'unlock' && error.name === 'OperationError'
       ? '主密码错误，无法解锁保险库'
       : form.dataset.form === 'recovery-reset'
         ? '恢复密钥无效，无法重设主密码'
@@ -759,6 +1140,9 @@ async function handleSubmit(event) {
           ? '远端主密码错误，无法完成拉取'
         : (error.message || '操作失败');
     toast(friendlyError);
+  } finally {
+    delete form.dataset.submitting;
+    if (submitButton) submitButton.disabled = false;
   }
 }
 
@@ -779,7 +1163,7 @@ async function handleAction(event) {
     return;
   }
   if (action === 'copy-recovery') { await copyText(control.dataset.code, '恢复密钥已复制'); return; }
-  if (action === 'finish-setup') { state.modal = null; render(); return; }
+  if (action === 'finish-setup') { state.modal = null; render(); resetLockTimer(); startSyncSession(); return; }
   if (action === 'open-recovery-reset') { state.modal = { type: 'recovery-reset' }; render(); return; }
   if (action === 'view') { state.view = control.dataset.viewName; state.settingsDetail = false; state.drawerOpen = false; render(); return; }
   if (action === 'mobile-left') { if (state.settingsDetail) { state.settingsDetail = false; render(); } else { state.drawerOpen = true; render(); } return; }
@@ -803,6 +1187,7 @@ async function handleAction(event) {
   if (action === 'delete-category') { const category = control.dataset.category; if (DEFAULT_CATEGORIES.includes(category)) return toast('默认分类不可删除'); if (state.vault.entries.some((entry) => entry.category === category)) return toast('该分类仍有条目，无法删除'); state.vault.categories = state.vault.categories.filter((item) => item !== category); await persistVault(); render(); return; }
   if (action === 'open-sync') { state.modal = { type: 'sync' }; render(); return; }
   if (action === 'open-sync-config') { state.modal = { type: 'sync-config' }; render(); return; }
+  if (action === 'toggle-auto-sync') { state.vault.sync.automatic = state.vault.sync.automatic === false; stopSyncSession(); await persistVault(); startSyncSession(); render(); return; }
   if (action === 'pull-remote') { await pullRemote(); return; }
   if (action === 'push-remote') { await pushRemote(); return; }
   if (action === 'export-backup') { await downloadBackup(); return; }
@@ -821,6 +1206,10 @@ app.addEventListener('change', async (event) => {
 });
 
 for (const eventName of ['pointerdown', 'keydown', 'touchstart']) document.addEventListener(eventName, resetLockTimer, { passive: true });
+window.addEventListener('online', () => { refreshSyncStatus(); scheduleAutoSync(0); });
+window.addEventListener('offline', refreshSyncStatus);
+window.addEventListener('focus', () => scheduleAutoSync(0));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleAutoSync(0); });
 window.addEventListener('resize', () => { if (!window.matchMedia('(max-width: 899px)').matches && state.settingsDetail) { state.settingsDetail = false; render(); } });
 
 async function bootstrap() {

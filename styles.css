@@ -89,6 +89,14 @@ textarea.field { min-height: 86px; padding: 10px 12px; resize: vertical; }
 .sync-button { min-height: 36px; display: inline-flex; align-items: center; gap: 8px; padding: 0 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--muted); cursor: pointer; }
 .sync-button:hover { background: var(--surface-alt); color: var(--text); }
 .sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warning); }
+.sync-button[data-sync-status="synced"] .sync-dot { background: var(--primary); }
+.sync-button[data-sync-status="error"] .sync-dot { background: var(--danger); }
+.sync-button[data-sync-status="local"] .sync-dot { background: var(--muted); }
+.notice[data-sync-status="synced"], .notice[data-sync-status="local"] { border-color: var(--line); background: var(--surface); color: var(--muted); }
+.notice[data-sync-status="error"] { border-color: color-mix(in srgb, var(--danger) 36%, var(--line)); background: var(--danger-soft); color: var(--danger); }
+.notice-copy [data-sync-icon] { display: inline-flex; flex: none; }
+.notice-copy [data-sync-detail] { overflow-wrap: anywhere; }
+.sync-backup { width: 100%; margin-top: 12px; }
 .icon-button { width: 36px; height: 36px; display: inline-grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
 .icon-button:hover { background: var(--surface-alt); color: var(--text); }
 .icon-button svg { width: 19px; height: 19px; }
