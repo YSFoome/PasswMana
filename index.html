@@ -2,17 +2,19 @@
 <html lang="zh-CN" data-mode="system" data-accent="emerald">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://api.github.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <meta name="theme-color" content="#087c58" />
     <meta name="description" content="PasswMana - 本地加密的离线密码库" />
+    <meta name="referrer" content="no-referrer" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./icon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
     <title>PasswMana</title>
   </head>
   <body>
-    <div id="app" aria-live="polite"></div>
-    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+    <div id="app"></div>
+    <script src="./vendor/lucide-0.468.0.min.js" defer></script>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

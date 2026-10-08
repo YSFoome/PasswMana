@@ -29,6 +29,18 @@ function response(status, result, headers = {}) {
     return { status, ok: status >= 200 && status < 300, headers: { get: (name) => headers[name.toLowerCase()] ?? null }, json: async () => result };
 }
 
+function scriptWithModuleMocks(source) {
+    // Keep each zero-build module in its own scope while making imported bindings
+    // replaceable for network, storage, and encryption race fixtures.
+    return source.replace(/import\s*\{([\s\S]*?)\}\s*from\s*['"](.\/[^'"]+)['"];?/g, (_statement, bindings, relativePath) => {
+        const modulePath = path.resolve(path.dirname(sourcePath), relativePath);
+        const moduleSource = fs.readFileSync(modulePath, 'utf8');
+        const exportedNames = [...moduleSource.matchAll(/export\s+(?:async\s+)?(?:function|const|let|class)\s+(\w+)/g)].map((match) => match[1]);
+        const body = moduleSource.replace(/\bexport\s+(?=(?:async\s+)?(?:function|const|let|class)\b)/g, '');
+        return `let { ${bindings} } = (() => { ${body}\nreturn { ${exportedNames.join(', ')} }; })();`;
+    });
+}
+
 function loadApp(fetchHandler = async () => response(404, {}), { repositoryResult = { private: true } } = {}) {
     const saved = [];
     const notices = [];
@@ -36,7 +48,7 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
     const requests = [];
     const timers = new Map();
     let timerId = 0;
-    const appElement = { addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }, innerHTML: '', textContent: '' };
+    const appElement = { addEventListener() {}, append() {}, querySelector() { return null; }, querySelectorAll() { return []; }, innerHTML: '', textContent: '' };
     const context = vm.createContext({
         crypto: webcrypto,
         TextEncoder,
@@ -50,7 +62,11 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
         console,
         queueMicrotask,
         structuredClone,
-        document: { getElementById: () => appElement, addEventListener() {}, querySelector() { return null; }, documentElement: { dataset: {} }, visibilityState: 'visible', hidden: false },
+        document: {
+            getElementById: () => appElement, addEventListener() {}, querySelector() { return null; },
+            createElement: () => ({ setAttribute() {}, addEventListener() {}, append() {}, querySelector() { return null; }, dataset: {}, classList: { add() {}, remove() {}, toggle() {} } }),
+            documentElement: { dataset: {} }, visibilityState: 'visible', hidden: false,
+        },
         window: { addEventListener() {}, matchMedia: () => ({ matches: false }) },
         navigator: { onLine: true },
         localStorage: { getItem() { return null; }, setItem() {} },
@@ -76,8 +92,8 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
         __save(record) { saved.push(clone(record)); },
         __notice(message) { notices.push(message); },
     });
-    const source = fs.readFileSync(sourcePath, 'utf8').replace(/bootstrap\(\)\.catch\([\s\S]*?\);\s*$/, '');
-    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaults, encryptText, decryptText, persistVault, synchronize, pushRemote, pullRemote, lockVault, defaultVault, remoteRequest };`, context, { filename: sourcePath });
+    const source = scriptWithModuleMocks(fs.readFileSync(sourcePath, 'utf8').replace(/bootstrap\(\)\.catch\([\s\S]*?\);\s*$/, ''));
+    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaults, mergeVaultChanges, collectVaultConflicts, resolveSyncConflicts, keyMetadata, encryptText, decryptText: (value, key) => decryptText(JSON.parse(JSON.stringify(value)), key), persistVault, synchronize, pushRemote, pullRemote, lockVault, defaultVault, remoteRequest };`, context, { filename: sourcePath });
     return { api: context.testApi, context, saved, notices, confirmations, requests, timers };
 }
 
@@ -89,12 +105,11 @@ async function initialize(app, local, base = local, { bound = true, dirty = true
     app.api.state.vault = clone(local);
     app.api.state.record = {
         format: 'passwmana-v1', createdAt: timestamp, updatedAt: timestamp,
-        masterSalt: 'fake-test-salt', recoverySalt: 'fake-test-salt',
-        wrappedVaultKey: { iv: 'fake-test-iv', data: 'fake-test-wrapper' },
-        recoveryWrappedVaultKey: { iv: 'fake-test-iv', data: 'fake-test-wrapper' },
+        ...passwordMetadata(2),
         encryptedVault: await app.api.encryptText(JSON.stringify(local), key),
         remoteSha: bound ? 'sha-base' : null,
         syncBase: bound ? await app.api.encryptText(JSON.stringify(base), key) : null,
+        syncKeyBase: bound ? passwordMetadata(2) : null,
         dirty,
     };
     return key;
@@ -103,9 +118,7 @@ async function initialize(app, local, base = local, { bound = true, dirty = true
 async function remoteFile(app, remoteVault, sha = 'sha-remote', key = app.api.state.vaultKey) {
     const payload = {
         format: 'passwmana-v1', createdAt: timestamp, updatedAt: timestamp,
-        masterSalt: 'remote-test-salt', recoverySalt: 'remote-test-salt',
-        wrappedVaultKey: { iv: 'remote-test-iv', data: 'remote-test-wrapper' },
-        recoveryWrappedVaultKey: { iv: 'remote-test-iv', data: 'remote-test-wrapper' },
+        ...clone(app.api.keyMetadata(app.api.state.record)),
         encryptedVault: await app.api.encryptText(JSON.stringify(remoteVault), key),
     };
     return { sha, content: btoa(JSON.stringify(payload)), payload };
@@ -619,4 +632,218 @@ test('automatic remote polling preserves the last user activity and remaining lo
     lockTimer.callback();
     assert.equal(app.api.state.vault, null);
     assert.equal(app.api.state.vaultKey, null);
+});
+
+function passwordMetadata(marker) {
+    const encoded = (size, offset = 0) => btoa(String.fromCharCode(...new Uint8Array(size).fill(marker + offset)));
+    return {
+        masterSalt: encoded(16), recoverySalt: encoded(16, 1),
+        wrappedVaultKey: { iv: encoded(12), data: encoded(60) },
+        recoveryWrappedVaultKey: { iv: encoded(12, 1), data: encoded(60, 1) },
+    };
+}
+
+function changeRemoteMetadata(file, metadata) {
+    Object.assign(file.payload, clone(metadata));
+    file.content = btoa(JSON.stringify(file.payload));
+    return file;
+}
+
+test('field merge retains independent changes to the same entry without exposing sync credentials', () => {
+    const app = loadApp();
+    const base = vault({ entries: [entry('a')] });
+    const local = vault({ entries: [entry('a', { password: 'synthetic-local-password' })] });
+    const remote = vault({ entries: [entry('a', { notes: 'independent remote note' })] });
+    const result = clone(app.api.mergeVaultChanges(base, local, remote));
+    assert.equal(result.conflicts.length, 0);
+    assert.equal(result.vault.entries[0].password, 'synthetic-local-password');
+    assert.equal(result.vault.entries[0].notes, 'independent remote note');
+    remote.entries[0].password = 'synthetic-remote-password';
+    const conflicts = clone(app.api.collectVaultConflicts(base, local, remote));
+    assert.deepEqual(conflicts.map((item) => item.field), ['password']);
+    assert.ok(!JSON.stringify(conflicts).includes(deviceSync.token));
+    const resolved = clone(app.api.mergeVaultChanges(base, local, remote, { choices: { [conflicts[0].id]: 'remote' } }));
+    assert.equal(resolved.conflicts.length, 0);
+    assert.equal(resolved.vault.entries[0].password, 'synthetic-remote-password');
+    assert.equal(resolved.vault.entries[0].notes, 'independent remote note');
+});
+
+test('an entry upload adopts a remote password change instead of rolling it back', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-accepted' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'ordinary local edit' })] }), base);
+    const oldMetadata = passwordMetadata(20);
+    const newMetadata = passwordMetadata(30);
+    Object.assign(app.api.state.record, clone(oldMetadata), { syncKeyBase: clone(oldMetadata) });
+    remote = changeRemoteMetadata(await remoteFile(app, base), newMetadata);
+    await app.api.synchronize();
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.ok(put);
+    const uploaded = JSON.parse(atob(put.body.content));
+    assert.deepEqual(clone(app.api.keyMetadata(uploaded)), newMetadata);
+    assert.deepEqual(clone(app.api.keyMetadata(app.api.state.record)), newMetadata);
+    assert.equal((await pushedVault(app, put)).entries[0].notes, 'ordinary local edit');
+    assert.ok(!Object.hasOwn(uploaded, 'syncKeyBase'));
+});
+
+test('a local password change survives an unrelated remote entry update', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-accepted' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base);
+    const oldMetadata = passwordMetadata(40);
+    const newMetadata = passwordMetadata(50);
+    Object.assign(app.api.state.record, clone(newMetadata), { syncKeyBase: clone(oldMetadata) });
+    remote = changeRemoteMetadata(await remoteFile(app, vault({ entries: [entry('a', { notes: 'remote edit' })] })), oldMetadata);
+    await app.api.synchronize();
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.ok(put);
+    assert.deepEqual(clone(app.api.keyMetadata(JSON.parse(atob(put.body.content)))), newMetadata);
+    assert.equal((await pushedVault(app, put)).entries[0].notes, 'remote edit');
+});
+
+test('a clean device adopts remote password wrappers before its next unlock', async () => {
+    let remote;
+    const app = loadApp(async () => response(200, remote));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base, { dirty: false });
+    const oldMetadata = passwordMetadata(60);
+    const newMetadata = passwordMetadata(70);
+    Object.assign(app.api.state.record, clone(oldMetadata), { syncKeyBase: clone(oldMetadata) });
+    remote = changeRemoteMetadata(await remoteFile(app, base), newMetadata);
+    await app.api.synchronize({ automatic: true });
+    assert.deepEqual(clone(app.api.keyMetadata(app.api.state.record)), newMetadata);
+    assert.deepEqual(clone(app.api.state.record.syncKeyBase), newMetadata);
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+});
+
+test('simultaneous password changes stop uploads until the user chooses one complete wrapping version', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-resolved' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base);
+    const oldMetadata = passwordMetadata(80);
+    const localMetadata = passwordMetadata(90);
+    const remoteMetadata = passwordMetadata(100);
+    Object.assign(app.api.state.record, clone(localMetadata), { syncKeyBase: clone(oldMetadata) });
+    remote = changeRemoteMetadata(await remoteFile(app, base), remoteMetadata);
+    await app.api.synchronize({ automatic: true });
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+    assert.equal(app.api.state.syncLastError?.code, 'conflict');
+    assert.equal(app.api.state.syncConflict?.conflicts[0].kind, 'master-password');
+    assert.ok(!JSON.stringify(app.api.state.syncConflict).includes(deviceSync.token));
+    assert.deepEqual(clone(app.api.keyMetadata(app.api.state.record)), localMetadata);
+    await app.api.resolveSyncConflicts({ 'key:master-password': 'remote' });
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.ok(put);
+    assert.deepEqual(clone(app.api.keyMetadata(JSON.parse(atob(put.body.content)))), remoteMetadata);
+    assert.equal(app.api.state.syncConflict, null);
+    assert.equal(app.api.state.record.dirty, false);
+});
+
+test('an old baseline without password wrappers refuses to overwrite an unknown password version', async () => {
+    let remote;
+    const app = loadApp(async () => response(200, remote));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'local edit' })] }), base);
+    delete app.api.state.record.syncKeyBase;
+    remote = changeRemoteMetadata(await remoteFile(app, base), passwordMetadata(110));
+    await app.api.synchronize();
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+    assert.equal(app.api.state.syncConflict?.conflicts[0].kind, 'master-password');
+    assert.equal(app.api.state.record.dirty, true);
+    assert.equal(app.api.state.vault.entries[0].notes, 'local edit');
+});
+
+test('conflict selection fresh-reads the remote SHA and preserves other device additions', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-resolved' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'local note' })] }), base);
+    remote = await remoteFile(app, vault({ entries: [entry('a', { notes: 'remote note' })] }), 'sha-conflict');
+    await app.api.synchronize();
+    const choices = Object.fromEntries(app.api.state.syncConflict.conflicts.map((item) => [item.id, 'local']));
+    const reads = contentsRequests(app).filter((request) => request.method === 'GET').length;
+    remote = await remoteFile(app, vault({ entries: [entry('a', { notes: 'remote note' }), entry('remote-added')] }), 'sha-new-conflict');
+    await app.api.resolveSyncConflicts(choices);
+    assert.ok(contentsRequests(app).filter((request) => request.method === 'GET').length > reads);
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0, 'choices from an older remote version must not overwrite new changes');
+    assert.equal(app.api.state.syncConflict.sha, 'sha-new-conflict');
+    const newChoices = Object.fromEntries(app.api.state.syncConflict.conflicts.map((item) => [item.id, 'local']));
+    await app.api.resolveSyncConflicts(newChoices);
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.equal(put.body.sha, 'sha-new-conflict');
+    const uploaded = await pushedVault(app, put);
+    assert.equal(uploaded.entries.find((item) => item.id === 'a').notes, 'local note');
+    assert.ok(uploaded.entries.some((item) => item.id === 'remote-added'));
+});
+
+test('edits made while reviewing a conflict invalidate old choices instead of discarding the edit', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-resolved' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'local note' })] }), base);
+    remote = await remoteFile(app, vault({ entries: [entry('a', { notes: 'remote note' })] }));
+    await app.api.synchronize();
+    const choices = Object.fromEntries(app.api.state.syncConflict.conflicts.map((item) => [item.id, 'remote']));
+    app.api.state.vault.entries[0].notes = 'newer local note';
+    await app.api.persistVault();
+    await app.api.resolveSyncConflicts(choices);
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+    assert.equal(app.api.state.vault.entries[0].notes, 'newer local note');
+    assert.equal(app.api.state.syncConflict.conflicts[0].local, 'newer local note');
+});
+
+test('a failed merge storage write prevents PUT and preserves merged edits for a later save', async () => {
+    let remote;
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-should-not-upload' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'local edit' })] }), base);
+    remote = await remoteFile(app, vault({ entries: [entry('a'), entry('remote-added')] }));
+    app.context.__save = () => { throw new Error('synthetic merge storage failure'); };
+    await app.api.synchronize();
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+    assert.equal(app.api.state.syncLastError?.code, 'storage');
+    assert.match(app.api.state.localSaveError?.message, /synthetic merge storage failure/);
+    assert.equal(app.api.state.record.dirty, true);
+    assert.equal(app.api.state.vault.entries.find((item) => item.id === 'a').notes, 'local edit');
+    assert.ok(app.api.state.vault.entries.some((item) => item.id === 'remote-added'));
+});
+
+test('an edit during the merge storage write retains the accepted remote password version', async () => {
+    let remote;
+    const mergeWriteStarted = deferred();
+    const mergeWriteFinished = deferred();
+    const app = loadApp(async (request) => request.method === 'GET' ? response(200, remote) : response(200, { content: { sha: 'sha-accepted' } }));
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'initial local note' })] }), base);
+    const oldMetadata = passwordMetadata(120);
+    const remoteMetadata = passwordMetadata(130);
+    Object.assign(app.api.state.record, clone(oldMetadata), { syncKeyBase: clone(oldMetadata) });
+    remote = changeRemoteMetadata(await remoteFile(app, vault({ entries: [entry('a'), entry('remote-added')] })), remoteMetadata);
+    const originalSave = app.context.__save;
+    let paused = false;
+    app.context.__save = (record) => {
+        if (!paused) {
+            paused = true;
+            mergeWriteStarted.resolve();
+            return mergeWriteFinished.promise.then(() => originalSave(record));
+        }
+        return originalSave(record);
+    };
+    const syncing = app.api.synchronize();
+    await mergeWriteStarted.promise;
+    app.api.state.vault.entries.find((item) => item.id === 'a').notes = 'edit during merge storage';
+    const saving = app.api.persistVault();
+    mergeWriteFinished.resolve();
+    await Promise.all([syncing, saving]);
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.ok(put);
+    const uploadedRecord = JSON.parse(atob(put.body.content));
+    assert.deepEqual(clone(app.api.keyMetadata(uploadedRecord)), remoteMetadata);
+    const uploadedVault = await pushedVault(app, put);
+    assert.equal(uploadedVault.entries.find((item) => item.id === 'a').notes, 'edit during merge storage');
+    assert.ok(uploadedVault.entries.some((item) => item.id === 'remote-added'));
+    assert.deepEqual(clone(app.api.keyMetadata(app.api.state.record)), remoteMetadata);
 });

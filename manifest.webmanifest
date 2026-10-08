@@ -2,6 +2,7 @@
   "name": "PasswMana",
   "short_name": "PasswMana",
   "description": "本地加密的离线密码库",
+  "id": "./",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
