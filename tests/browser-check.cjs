@@ -287,8 +287,11 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await setting(page, 'categories', mobile);
         await visibleClick(page, '[data-action="add-category"]');
         await page.waitForFunction((category) => __testApi.state.vault.categories.includes(category), promptValue);
-        assert.equal(await page.locator(`[data-action="delete-category"][data-category="${promptValue}"]`).count(), 1, 'A category added in the first session must be deletable');
-        await page.locator(`[data-action="delete-category"][data-category="${promptValue}"]`).click();
+        const addedCategoryDelete = page.locator(`[data-action="delete-category"][data-category="${promptValue}"]`);
+        await addedCategoryDelete.waitFor();
+        assert.equal(await addedCategoryDelete.count(), 1, 'A category added in the first session must be deletable');
+        await addedCategoryDelete.click();
+        await addedCategoryDelete.waitFor({ state: 'hidden' });
         await page.waitForFunction((category) => !__testApi.state.vault.categories.includes(category), promptValue);
         await navigate(page, 'vault', mobile);
         await checkKeyboardAndGenerator(page);
