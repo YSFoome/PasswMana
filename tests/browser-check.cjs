@@ -304,6 +304,8 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await setting(page, 'appearance', mobile);
         await page.locator('[data-action="set-mode"][data-mode="dark"]').click();
         await page.locator('[data-action="set-accent"][data-accent="blue"]').click();
+        assert.equal(await page.locator('html').getAttribute('data-mode'), 'dark');
+        assert.equal(await page.locator('html').getAttribute('data-accent'), 'blue');
         await page.reload();
         assert.equal(await page.locator('html').getAttribute('data-mode'), 'dark');
         assert.equal(await page.locator('html').getAttribute('data-accent'), 'blue');
@@ -355,10 +357,12 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
 
         await setting(page, 'sync', mobile);
         const hostileId = 'synthetic" data-injected-test="true"><img src="synthetic-invalid" onerror="globalThis.__migrationInjected=true">';
+        const migrationComplete = page.waitForEvent('dialog', { predicate: (dialog) => dialog.type() === 'alert' && dialog.message().startsWith('迁移完成：') });
         await uploadFile(page, 'import-legacy', 'synthetic-legacy.json', Buffer.from(JSON.stringify({ entries: [
             { id: 'synthetic-legacy', siteName: 'Synthetic legacy entry', account: 'test@example.invalid', password: 'synthetic-legacy-password', type: 'Synthetic category' },
             { id: hostileId, siteName: 'Synthetic hostile ID', account: 'test@example.invalid', password: 'synthetic-hostile-password', type: '个人', url: 'javascript:globalThis.__migrationInjected=true' },
         ] })));
+        await migrationComplete;
         await page.waitForFunction(() => __testApi.state.vault.entries.length === 3);
         assert.ok(await page.evaluate(() => __testApi.state.vault.categories.includes('Synthetic category')));
         await navigate(page, 'vault', mobile);
@@ -368,9 +372,15 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.locator('.modal a[href^="javascript:"]').count(), 0);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         await page.locator('[data-action="delete-entry"]').click();
+        await page.locator('[data-action="delete-entry"]').waitFor({ state: 'hidden' });
         await setting(page, 'trash', mobile);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         await page.locator('[data-action="restore-entry"]').click();
+        // Restoring changes memory before its encrypted IndexedDB write finishes.
+        // Wait for the post-save render before reloading and checking persistence.
+        await page.locator('[data-action="restore-entry"]').waitFor({ state: 'hidden' });
+        await navigate(page, 'vault', mobile);
+        await page.locator('.entry').filter({ hasText: 'Synthetic hostile ID' }).waitFor();
         await page.reload();
         await unlock(page);
         await navigate(page, 'vault', mobile);
