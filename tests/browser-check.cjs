@@ -52,6 +52,80 @@ async function setting(page, panel, mobile) {
     await page.locator(`.settings-nav [data-panel="${panel}"]`).click();
 }
 
+async function checkSettingsNavigation(page, outputDirectory, mobile, screenshotName) {
+    const panels = ['sync', 'security', 'appearance', 'categories', 'trash'];
+    await navigate(page, 'settings', mobile);
+    const navigation = page.locator('.settings-nav');
+    await navigation.waitFor();
+    assert.equal(await navigation.locator('button:visible').count(), panels.length);
+    if (mobile) {
+        assert.equal(await page.locator('.settings-panel:visible').count(), 0, 'The mobile settings list must show navigation before detail');
+        await page.screenshot({ path: path.join(outputDirectory, `settings-list-${screenshotName}.png`), fullPage: true });
+    }
+    let originalButtonPositions;
+    for (const panel of panels) {
+        await navigation.locator(`[data-panel="${panel}"]`).click();
+        const activeButton = navigation.locator('button.active');
+        const activePanel = page.locator('.settings-panel.active');
+        assert.equal(await activeButton.count(), 1, 'Exactly one settings navigation button must be selected');
+        assert.equal(await activeButton.getAttribute('data-panel'), panel);
+        assert.equal(await activeButton.getAttribute('aria-current'), 'page');
+        assert.equal(await navigation.locator('[aria-current="page"]').count(), 1);
+        assert.equal(await activePanel.count(), 1, 'Exactly one settings panel must be active');
+        assert.equal(await activePanel.getAttribute('data-panel'), panel);
+        await activePanel.waitFor();
+        assert.equal(await page.locator('.settings-panel:visible').count(), 1);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${screenshotName} ${panel} settings must fit their viewport`);
+        if (mobile) {
+            assert.equal(await navigation.isVisible(), false, 'Mobile details must hide the settings list');
+            assert.equal(await page.locator('[data-action="mobile-left"]').getAttribute('aria-label'), '返回设置');
+        } else {
+            const buttonPositions = await navigation.locator('button').evaluateAll((buttons) => buttons.map((button) => {
+                const rectangle = button.getBoundingClientRect();
+                return { top: rectangle.top, height: rectangle.height };
+            }));
+            for (const button of buttonPositions) assert.ok(button.height >= 36 && button.height <= 48, `${panel} navigation buttons must remain compact; observed ${button.height}px`);
+            if (originalButtonPositions) {
+                for (let index = 0; index < buttonPositions.length; index += 1) {
+                    assert.ok(Math.abs(buttonPositions[index].top - originalButtonPositions[index].top) <= 1, 'Changing the panel must not stretch or reposition the settings navigation');
+                }
+            } else originalButtonPositions = buttonPositions;
+            if (panel === 'sync') {
+                const hoveredButton = navigation.locator('[data-panel="appearance"]');
+                await hoveredButton.hover();
+                const hoverBackground = await hoveredButton.evaluate((button) => getComputedStyle(button).backgroundColor);
+                const activeBackground = await activeButton.evaluate((button) => getComputedStyle(button).backgroundColor);
+                assert.notEqual(hoverBackground, activeBackground, 'Hover must look different from the selected setting');
+                assert.equal(await hoveredButton.getAttribute('aria-current'), null);
+                assert.equal(await activeButton.getAttribute('data-panel'), 'sync', 'Hover must not change the selected panel');
+            }
+        }
+        await page.screenshot({ path: path.join(outputDirectory, `settings-${panel}-${screenshotName}.png`), fullPage: true });
+        if (mobile) {
+            await page.locator('[data-action="mobile-left"]').click();
+            await navigation.waitFor();
+            assert.equal(await navigation.locator('button:visible').count(), panels.length);
+            assert.equal(await page.locator('.settings-panel:visible').count(), 0);
+            assert.equal(await page.locator('[data-action="mobile-left"]').getAttribute('aria-label'), '打开导航');
+            const heights = await navigation.locator('button').evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().height));
+            assert.ok(heights.every((height) => height >= 44 && height <= 80), 'Mobile navigation must keep usable, compact touch targets');
+        }
+    }
+    if (!mobile) {
+        const focusButton = navigation.locator('[data-panel="sync"]');
+        await page.mouse.move(1, 1);
+        await focusButton.focus();
+        await page.keyboard.press('Tab');
+        await page.keyboard.press('Shift+Tab');
+        assert.ok(await focusButton.evaluate((button) => button === document.activeElement));
+        const outline = await focusButton.evaluate((button) => ({ width: getComputedStyle(button).outlineWidth, style: getComputedStyle(button).outlineStyle }));
+        assert.ok(Number.parseFloat(outline.width) > 0 && outline.style !== 'none', 'Keyboard focus must have a visible outline independent of selection');
+        assert.equal(await navigation.locator('button.active').getAttribute('data-panel'), 'trash', 'Keyboard focus must not change selection');
+        await page.screenshot({ path: path.join(outputDirectory, `settings-focus-${screenshotName}.png`), fullPage: true });
+    }
+    await navigate(page, 'vault', mobile);
+}
+
 async function unlock(page, password = masterPassword, expectUnlocked = password === masterPassword) {
     const form = page.locator('[data-form="unlock"]');
     await form.locator('[name="password"]').fill(password);
@@ -209,6 +283,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.locator('[data-action="finish-setup"]').click();
 
         await page.getByText('还没有密码条目', { exact: true }).waitFor();
+        await checkSettingsNavigation(page, outputDirectory, mobile, name);
         await setting(page, 'categories', mobile);
         await visibleClick(page, '[data-action="add-category"]');
         await page.waitForFunction((category) => __testApi.state.vault.categories.includes(category), promptValue);
@@ -515,6 +590,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         const originalViewport = page.viewportSize();
         const zoomViewport = { width: Math.round(originalViewport.width / 2), height: originalViewport.height };
         await page.setViewportSize(zoomViewport);
+        await checkSettingsNavigation(page, outputDirectory, true, `reflow-200-${name}`);
         await navigate(page, 'vault', true);
         await visibleClick(page, '[data-action="open-add"]');
         assert.ok(await page.locator('[data-form="add-entry"] [name="title"]').isVisible());
@@ -563,7 +639,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.locator('[data-action="resume-draft"]').count(), 0);
         await page.screenshot({ path: path.join(outputDirectory, `vault-${name}.png`), fullPage: true });
         assert.deepEqual(browserErrors, []);
-        console.log(`PASS ${name}: recovery verification/reset/tab protection/latest record, keyboard focus/Esc, generator/account copy/safe links, CRUD/trash, password errors/change/unlock, categories/theme, validated backup/malicious migration, connection wizard, automatic sync, background draft/stale edit, masked conflict choices, 401, 200% reflow, idle lock/encrypted draft recovery`);
+        console.log(`PASS ${name}: compact settings navigation/selection/hover/focus/mobile back, recovery verification/reset/tab protection/latest record, keyboard focus/Esc, generator/account copy/safe links, CRUD/trash, password errors/change/unlock, categories/theme, validated backup/malicious migration, connection wizard, automatic sync, background draft/stale edit, masked conflict choices, 401, 200% reflow, idle lock/encrypted draft recovery`);
     } finally {
         await context.close();
     }

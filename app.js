@@ -339,7 +339,7 @@ function renderVault() {
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: '外观', categories: '分类', trash: '回收站' };
 
 function settingsNavigation() {
-  return `<nav class="settings-nav" aria-label="设置分类">${Object.entries(settingLabels).map(([key, label]) => `<button class="${state.settingPanel === key ? 'active' : ''}" data-action="setting-panel" data-panel="${key}">${icon({ sync: 'refresh-cw', security: 'shield-check', appearance: 'paintbrush', categories: 'tags', trash: 'trash-2' }[key])}${label}</button>`).join('')}</nav>`;
+  return `<nav class="settings-nav" aria-label="设置分类">${Object.entries(settingLabels).map(([key, label]) => `<button class="${state.settingPanel === key ? 'active' : ''}" ${state.settingPanel === key ? 'aria-current="page"' : ''} data-action="setting-panel" data-panel="${key}">${icon({ sync: 'refresh-cw', security: 'shield-check', appearance: 'paintbrush', categories: 'tags', trash: 'trash-2' }[key])}${label}</button>`).join('')}</nav>`;
 }
 
 function renderSyncSettings() {
