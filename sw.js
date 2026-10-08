@@ -1,6 +1,6 @@
 // Generated asset hashes are refreshed by node scripts/generate-sw.cjs.
 // BEGIN GENERATED SHELL
-const SHELL_VERSION = '5060ea1796693a1e5d4b1ec2b2e499a5d8feaf97025eab49a2dff5e198d2e606';
+const SHELL_VERSION = 'aaa3dcf639e63314894e518faf1e873a6c07106fd86bd9fd1783c8f15b9ee3c7';
 const APP_SHELL = [
     {
         "path": "./index.html",
@@ -8,7 +8,7 @@ const APP_SHELL = [
     },
     {
         "path": "./styles.css",
-        "sha256": "649f25b4de42934d80ffc89ac03c0b76099bfbd4a0e8b610f96edda224750782"
+        "sha256": "caf8d1b87b41953e070180dcdb365fe721382e46435c8d92b4df296dd17028e7"
     },
     {
         "path": "./app.js",

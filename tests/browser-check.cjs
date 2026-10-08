@@ -36,6 +36,46 @@ async function visibleClick(page, selector) {
     await page.locator(`${selector}:visible`).first().click();
 }
 
+async function assertNoHorizontalOverflow(page, outputDirectory, scenario) {
+    const horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
+    if (horizontalOverflow) {
+        const filename = path.join(outputDirectory, `overflow-${scenario.replace(/[^a-z0-9-]/gi, '-')}.png`);
+        await page.screenshot({ path: filename, fullPage: true });
+        const diagnostics = await page.evaluate(() => {
+            const selectorFor = (element) => {
+                const parts = [];
+                for (let node = element; node && node !== document.body && parts.length < 5; node = node.parentElement) {
+                    const tag = node.tagName.toLowerCase();
+                    if (node.id) { parts.unshift(`${tag}#${CSS.escape(node.id)}`); break; }
+                    let part = tag + [...node.classList].map((name) => `.${CSS.escape(name)}`).join('');
+                    if (node.dataset.panel) part += `[data-panel="${CSS.escape(node.dataset.panel)}"]`;
+                    else if (node.dataset.action) part += `[data-action="${CSS.escape(node.dataset.action)}"]`;
+                    const siblings = [...(node.parentElement?.children || [])].filter((sibling) => sibling.tagName === node.tagName);
+                    if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                    parts.unshift(part);
+                }
+                return parts.join(' > ');
+            };
+            const elements = [];
+            for (const node of document.querySelectorAll('body *')) {
+                const rectangle = node.getBoundingClientRect();
+                if (!rectangle.width || !rectangle.height) continue;
+                const style = getComputedStyle(node);
+                if (rectangle.right <= innerWidth + 0.5 && !(style.overflowX === 'visible' && node.scrollWidth > node.clientWidth + 1)) continue;
+                elements.push({ selector: selectorFor(node), left: rectangle.left, right: rectangle.right, width: rectangle.width,
+                    clientWidth: node.clientWidth, scrollWidth: node.scrollWidth, minWidth: style.minWidth,
+                    overflowX: style.overflowX, overflowWrap: style.overflowWrap, whiteSpace: style.whiteSpace,
+                    fontFamily: style.fontFamily, fontSize: style.fontSize });
+                if (elements.length === 20) break;
+            }
+            return { viewport: innerWidth, document: document.documentElement.scrollWidth, elements };
+        });
+        console.error(`Horizontal overflow screenshot: ${filename}`);
+        console.error(`Horizontal overflow diagnostics (${scenario}): ${JSON.stringify(diagnostics, null, 2)}`);
+    }
+    assert.equal(horizontalOverflow, false, `${scenario} must fit its viewport`);
+}
+
 async function navigate(page, view, mobile) {
     if (mobile) {
         await page.locator('[data-action="mobile-left"]').click();
@@ -75,7 +115,7 @@ async function checkSettingsNavigation(page, outputDirectory, mobile, screenshot
         assert.equal(await activePanel.getAttribute('data-panel'), panel);
         await activePanel.waitFor();
         assert.equal(await page.locator('.settings-panel:visible').count(), 1);
-        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${screenshotName} ${panel} settings must fit their viewport`);
+        await assertNoHorizontalOverflow(page, outputDirectory, `settings-${panel}-${screenshotName}`);
         if (mobile) {
             assert.equal(await navigation.isVisible(), false, 'Mobile details must hide the settings list');
             assert.equal(await page.locator('[data-action="mobile-left"]').getAttribute('aria-label'), '返回设置');
@@ -586,8 +626,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
 
         await setting(page, 'sync', mobile);
         await page.screenshot({ path: path.join(outputDirectory, `sync-${name}.png`), fullPage: true });
-        const horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
-        assert.equal(horizontalOverflow, false, `${name} page must fit its viewport`);
+        await assertNoHorizontalOverflow(page, outputDirectory, `sync-${name}`);
 
         // Browser zoom halves the CSS viewport. Exercise its 200% reflow size.
         const originalViewport = page.viewportSize();
@@ -598,12 +637,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await visibleClick(page, '[data-action="open-add"]');
         assert.ok(await page.locator('[data-form="add-entry"] [name="title"]').isVisible());
         await page.screenshot({ path: path.join(outputDirectory, `reflow-200-${name}.png`), fullPage: true });
-        const reflowOverflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
-        if (reflowOverflow) {
-            console.error('Reflow overflow:', await page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth,
-                elements: [...document.querySelectorAll('body *')].map((node) => ({ tag: node.tagName, className: String(node.className?.baseVal ?? node.className), right: node.getBoundingClientRect().right, width: node.getBoundingClientRect().width })).filter((node) => node.width > 0 && node.right > innerWidth + 1).slice(0, 20) })));
-        }
-        assert.equal(reflowOverflow, false, `${name} 200% reflow viewport must fit`);
+        await assertNoHorizontalOverflow(page, outputDirectory, `reflow-200-${name}`);
         await page.keyboard.press('Escape');
         await page.locator('[data-form="add-entry"]').waitFor({ state: 'hidden' });
         await page.setViewportSize(originalViewport);
