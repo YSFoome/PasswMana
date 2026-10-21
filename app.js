@@ -1,16 +1,19 @@
 import {
     DEFAULT_CATEGORIES, makeId, bytesToBase64, base64ToBytes, randomBase64, formatRecoveryCode,
-    dbGet, dbPut, deriveKey, encryptText, decryptText, importVaultKey, defaultVault,
+    dbGet, dbPut, deriveKey, encryptText, decryptText,
     createVault, unlockWithMaster, unlockWithRecovery, validateVault, validateEncryptedRecord,
-    prepareBackupRestore, commitBackupRestore, getRollbackRecord, restoreRollbackRecord,
+    prepareBackupRestore, commitBackupRestore, getRollbackRecord,
     saveEncryptedDraft, loadEncryptedDraft, clearEncryptedDraft,
 } from './vault-core.js';
-import { mergeVaults, mergeVaultChanges, collectVaultConflicts, conflictVaultSnapshot, sameValue, keyMetadata, mergeKeyMetadata } from './sync-core.js';
+import { mergeVaultChanges, conflictVaultSnapshot, sameValue, keyMetadata, mergeKeyMetadata } from './sync-core.js';
 
 const MAX_SYNC_ATTEMPTS = 3;
 const SYNC_DEBOUNCE_MS = 2000;
 const SYNC_POLL_MS = 60000;
 const SYNC_TIMEOUT_MS = 20000;
+const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
+const REVEAL_TIMEOUT_MS = 30000;
+const CLIPBOARD_CLEAR_MS = 30000;
 
 import { passwordStrength, generatePassword, safeWebUrl, parseGithubRepository, createClipboardManager, formValues, showFormError, enhanceDialogs, trapDialogKey } from './ui-helpers.js';
 
@@ -28,8 +31,6 @@ const state = {
   favoriteOnly: false,
   modal: null,
   syncing: null,
-  syncAutomatic: false,
-  syncAttempt: null,
   syncLastError: null,
   pendingRemote: null,
   session: 0,
@@ -52,6 +53,8 @@ const state = {
   lockWarningTimer: null,
   serviceWorkerRegistration: null,
   updateReady: false,
+  revealTimer: null,
+  storage: null,
 };
 
 const clipboardManager = createClipboardManager({
@@ -89,6 +92,14 @@ function queueStorage(operation) {
 async function persistVault({ dirty = true } = {}) {
     const record = state.record;
     const vaultKey = state.vaultKey;
+    // Refuse to encrypt a shape the unlock path would reject later. Without this
+    // guard a bad in-memory edit becomes an unopenable vault after reload.
+    try {
+        validateVault(state.vault);
+    } catch (error) {
+        state.localSaveError = error;
+        throw error;
+    }
     const snapshot = JSON.stringify(state.vault);
     const updatedAt = new Date().toISOString();
     state.vaultRevision += 1;
@@ -154,6 +165,8 @@ function lockVault() {
   clearTimeout(state.timer);
   clearTimeout(state.lockWarningTimer);
   clearTimeout(state.draftTimer);
+  clearTimeout(state.revealTimer);
+  state.revealTimer = null;
   captureEntryDraft();
   if (state.formDraft && state.vaultKey) void persistEntryDraft().catch(() => {});
   stopSyncSession();
@@ -162,7 +175,6 @@ function lockVault() {
   state.rawVaultKey = null;
   state.vault = null;
   state.modal = null;
-  state.syncAutomatic = false;
   state.pendingRemote = null;
   state.drawerOpen = false;
   state.formDraft = null;
@@ -181,18 +193,29 @@ function currentEntries() {
 }
 
 function timeLabel(iso) {
-  const elapsed = Date.now() - new Date(iso).getTime();
+  const time = Date.parse(iso);
+  if (!Number.isFinite(time)) return '时间未知';
+  const elapsed = Date.now() - time;
   if (elapsed < 60000) return '刚刚';
   if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)} 分钟前`;
   if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)} 小时前`;
   if (elapsed < 172800000) return '昨天';
-  return new Date(iso).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  return new Date(time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
 }
 
-function maskAccount(value) {
-  if (!value) return '未设置账户';
-  if (value.length <= 4) return '••••';
-  return `${value.slice(0, 2)}•••${value.slice(-2)}`;
+function hostOf(entry) {
+    try {
+        return new URL(entry.url).hostname.replace(/^www\./, '');
+    } catch { return ''; }
+}
+
+// A stable identity tab per site, derived from the host so every device agrees
+// without storing anything. Entries without a URL fall back to their title.
+function identityTab(entry) {
+    const key = hostOf(entry) || entry.title || '';
+    let hash = 0;
+    for (let index = 0; index < key.length; index += 1) hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
+    return hash % 8;
 }
 
 function validTimestamp(value, fallback) {
@@ -203,6 +226,10 @@ function convertLegacyBackup(data, currentVault) {
   if (!data || !Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
   const now = new Date().toISOString();
   const entriesById = new Map(currentVault.entries.map((entry) => [entry.id, entry]));
+  // Deleted entries keep their id in the trash. Re-importing the same legacy
+  // file must not recreate that id in entries: the vault format rejects an id
+  // that exists in both lists, and unlocking would then fail permanently.
+  const trashedIds = new Set(currentVault.trash.map((entry) => entry.id));
   const categories = new Set([...DEFAULT_CATEGORIES, ...currentVault.categories]);
   let added = 0;
   let updated = 0;
@@ -222,6 +249,12 @@ function convertLegacyBackup(data, currentVault) {
     const category = String(legacy.type || legacy.category || '个人').trim() || '个人';
     categories.add(category);
     const id = typeof legacy.id === 'string' && legacy.id ? legacy.id : makeId();
+    if (!entriesById.has(id) && trashedIds.has(id)) {
+      // The person deleted this entry after an earlier migration; a merge should
+      // not resurrect it, and the trash copy already owns the id.
+      skipped += 1;
+      continue;
+    }
     const createdAt = validTimestamp(legacy.createdAt, validTimestamp(data.exportedAt, now));
     const updatedAt = validTimestamp(legacy.updatedAt, createdAt);
     const converted = {
@@ -249,40 +282,60 @@ function convertLegacyBackup(data, currentVault) {
   return { entries: [...entriesById.values()], categories: [...categories], added, updated, skipped };
 }
 
-function titleInitial(entry) {
-  return escapeHtml((entry.title || '?').trim().slice(0, 1).toUpperCase());
-}
-
 function renderRecovery(code) {
-    return `<main class="lock-screen"><section class="lock-panel"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>保存恢复密钥</h1><p>忘记主密码时，它是重新访问保险库的唯一方式。请先离线保存，再确认。</p><div class="recovery-box"><div class="recovery-code">${escapeHtml(code)}</div><button class="secondary-button" data-action="copy-recovery" data-code="${escapeHtml(code)}">${icon('copy')}复制恢复密钥</button></div><form class="form-stack" data-form="recovery-confirm"><label class="form-field">核验已保存的密钥最后 4 位<input class="field" name="recoverySuffix" maxlength="4" autocomplete="off" autocapitalize="characters" required /></label><p class="form-help">请从你保存的位置读取。确认之前不会自动隐藏此页面；刷新或关闭页面将无法再次显示密钥。</p><button class="primary-button" type="submit" data-action="finish-setup" disabled>已保存并核验，进入密码库</button></form></section></main>`;
+    return `<main class="lock-screen"><section class="lock-panel"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>保存恢复密钥</h1><p>忘记主密码时，它是重新访问保险库的唯一方式。请先离线保存，再确认。</p><div class="recovery-box"><div class="plate"><span class="recovery-code plate-value">${escapeHtml(code)}</span></div><div class="recovery-actions"><button class="secondary-button" data-action="copy-recovery" data-code="${escapeHtml(code)}">${icon('copy')}复制恢复密钥</button></div></div><form class="form-stack" data-form="recovery-confirm"><label class="form-field">核验已保存的密钥最后 4 位<input class="field" name="recoverySuffix" maxlength="4" autocomplete="off" autocapitalize="characters" required /></label><p class="form-help">请从你保存的位置读取。确认之前不会自动隐藏此页面；刷新或关闭页面将无法再次显示密钥。</p><button class="primary-button" type="submit" data-action="finish-setup" disabled>已保存并核验，进入密码库</button></form></section></main>`;
 }
 
 function renderSetup() {
-    return `<main class="lock-screen"><form class="lock-panel" data-form="setup"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>创建本地保险库</h1><p>主密码只在本设备用于解密，请为保险库使用独有的长密码。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="new-password" minlength="12" aria-describedby="password-help" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><p class="form-help" id="password-help" data-password-strength>至少 12 个字符，建议使用多个无关词组成的密码短语。</p><label class="form-field">确认主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label><button class="primary-button" type="submit">${icon('lock-keyhole')}创建保险库</button></div></form></main>`;
+    return `<main class="lock-screen"><form class="lock-panel" data-form="setup"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>创建本地保险库</h1><p>主密码只在本设备用于解密，请为保险库使用独有的长密码。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="new-password" minlength="12" aria-describedby="password-help" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><p class="form-help" id="password-help" data-password-strength>至少 12 个字符，建议使用多个无关词组成的密码短语。</p><label class="form-field">确认主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label><button class="primary-button" type="submit">${icon('lock-keyhole')}创建保险库</button></div><div class="device-plate"><span>本机加密 · 主密码与密钥不会离开此设备</span></div></form></main>`;
 }
 
 function renderUnlock() {
-  return `<main class="lock-screen"><form class="lock-panel" data-form="unlock"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>解锁保险库</h1><p>输入主密码以在本设备解密保险库。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" required autofocus /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><button class="primary-button" type="submit">${icon('unlock')}解锁</button><button class="secondary-button" type="button" data-action="open-recovery-reset">使用恢复密钥</button></div></form></main>`;
+  return `<main class="lock-screen"><form class="lock-panel" data-form="unlock"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>解锁保险库</h1><p>输入主密码以在本设备解密保险库。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><button class="primary-button" type="submit">${icon('unlock')}解锁</button><button class="secondary-button" type="button" data-action="open-recovery-reset">使用恢复密钥</button></div><div class="device-plate"><span>本机加密 · 主密码与密钥不会离开此设备</span></div></form></main>`;
 }
 
 function entryTemplate(entry) {
-  return `<button class="entry" data-action="open-detail" data-id="${escapeHtml(entry.id)}"><span class="entry-site"><span class="site-icon">${titleInitial(entry)}</span><span><strong>${escapeHtml(entry.title)}</strong><small>${escapeHtml(maskAccount(entry.username))}</small></span></span><span class="pill">${escapeHtml(entry.category)}</span><span class="pill">${entry.url ? '网站' : '账户'}</span><time>${timeLabel(entry.updatedAt)}</time>${entry.favorite ? icon('star', 'starred') : icon('chevron-right', 'chevron')}</button>`;
+    const id = escapeHtml(entry.id);
+    const host = hostOf(entry);
+    const url = safeWebUrl(entry.url);
+    const meta = [
+        entry.username ? `<span class="entry-account">${escapeHtml(entry.username)}</span>` : '',
+        host ? `<span class="entry-host">${escapeHtml(host)}</span>` : '',
+        `<span class="entry-time">${timeLabel(entry.updatedAt)}</span>`,
+    ].join('');
+    const tools = `<div class="entry-tools"><button class="row-tool" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制 ${escapeHtml(entry.title)} 的密码">${icon('copy')}</button>${url ? `<a class="row-tool" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="打开网站" aria-label="打开 ${escapeHtml(entry.title)} 的网站">${icon('external-link')}</a>` : ''}</div>`;
+    return `<div class="entry-row" data-tab="${identityTab(entry)}"><button class="entry" data-action="open-detail" data-id="${id}"><span class="entry-name"><span>${escapeHtml(entry.title)}</span>${entry.favorite ? icon('star', 'starred') : ''}</span><span class="entry-meta">${meta}</span></button>${tools}</div>`;
 }
 
 function vaultListTemplate() {
     const entries = currentEntries();
     if (!state.vault.entries.length) return `<div class="empty-state">${icon('vault')}<h2>还没有密码条目</h2><p>添加第一条密码，或导入已有保险库。</p><div class="empty-actions"><button class="primary-button" data-action="open-add">${icon('plus')}添加第一条密码</button><button class="secondary-button" data-action="import-backup">${icon('upload')}从备份导入</button></div></div>`;
     if (!entries.length) return `<div class="empty-state">${icon('search')}<h2>没有匹配的密码条目</h2><p>尝试其他关键词，或清除分类与收藏筛选。</p><button class="secondary-button" data-action="clear-filters">清除筛选</button></div>`;
-    const favorites = entries.filter((entry) => entry.favorite);
-    const rest = entries.filter((entry) => !entry.favorite);
-    return `${favorites.length ? `<div class="group-heading">收藏 <span>${favorites.length}</span></div>${favorites.map(entryTemplate).join('')}` : ''}${rest.length ? `<div class="group-heading">${favorites.length ? '全部条目' : '密码条目'} <span>${rest.length}</span></div>${rest.map(entryTemplate).join('')}` : ''}`;
+    // Group by the categories the person maintains, in their own order: the
+    // list should mirror how they think about their accounts, not a flat table.
+    const buckets = new Map();
+    for (const entry of entries) {
+        const known = entry.category && state.vault.categories.includes(entry.category);
+        const label = known ? entry.category : '未分类';
+        if (!buckets.has(label)) buckets.set(label, []);
+        buckets.get(label).push(entry);
+    }
+    return [...state.vault.categories, '未分类']
+        .filter((label) => buckets.has(label))
+        .map((label) => `<div class="group-heading"><strong>${escapeHtml(label)}</strong><span>${buckets.get(label).length}</span></div>${buckets.get(label).map(entryTemplate).join('')}`)
+        .join('');
 }
 
 function updateVaultList() {
+  normalizeCategoryFilter();
   const list = app.querySelector('[data-vault-list]');
   if (!list) return;
   list.innerHTML = vaultListTemplate();
   drawIcons();
+}
+
+function normalizeCategoryFilter() {
+  if (state.vault && state.category && !state.vault.categories.includes(state.category)) state.category = '';
 }
 
 function syncStatus() {
@@ -316,7 +369,7 @@ function refreshVaultViews() {
             if (secret) secret.textContent = state.modal.revealed ? entry.password : '••••••••••••••••';
             const title = app.querySelector('.modal-head h2');
             if (title) title.textContent = entry.title;
-        } else { state.modal = null; render(); toast('此条目已在其他设备删除'); }
+        } else { clearTimeout(state.revealTimer); state.revealTimer = null; state.modal = null; render(); toast('此条目已在其他设备删除'); }
     }
     const filter = app.querySelector('[data-input="category"]');
     if (filter && filter !== document.activeElement) {
@@ -329,11 +382,18 @@ function refreshVaultViews() {
         if (node && !node.contains(document.activeElement)) node.outerHTML = template();
     }
     refreshSyncStatus();
+    updateStorageStatus();
 }
 
 function renderVault() {
+  normalizeCategoryFilter();
   const status = syncStatus();
-  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}同步详情</button></div><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索站点、账户或分类" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
+  // The banner is a request for action, not a fixture. It appears only when
+  // something actually needs the person; the rest of the time the vault reports
+  // itself in one quiet line in the sidebar.
+  const actionable = status.status === 'error' || (syncConfigured() && !state.record.remoteSha);
+  const notice = actionable ? `<div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}同步详情</button></div>` : '';
+  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault">${notice}<div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索名称、账户、网址或备注" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
 }
 
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: '外观', categories: '分类', trash: '回收站' };
@@ -349,14 +409,72 @@ function renderSyncSettings() {
 }
 
 function renderSecuritySettings() {
-  return `<section class="settings-panel ${state.settingPanel === 'security' ? 'active' : ''}" data-panel="security"><h2>安全</h2><p class="panel-intro">主密码不会离开本设备。解锁后密钥只保留在当前会话内存中。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>自动锁定</strong><span>无操作后自动清除解锁密钥</span></div><select class="field inline-select" data-input="lock-minutes"><option value="0" ${state.vault.preferences.lockMinutes === 0 ? 'selected' : ''}>关闭</option><option value="1" ${state.vault.preferences.lockMinutes === 1 ? 'selected' : ''}>1 分钟</option><option value="5" ${state.vault.preferences.lockMinutes === 5 ? 'selected' : ''}>5 分钟</option><option value="15" ${state.vault.preferences.lockMinutes === 15 ? 'selected' : ''}>15 分钟</option><option value="30" ${state.vault.preferences.lockMinutes === 30 ? 'selected' : ''}>30 分钟</option></select></div><div class="setting-row"><div class="setting-copy"><strong>主密码</strong><span>只更新保险库密钥的主密码包装</span></div><button class="secondary-button" data-action="open-change-password">修改</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复密钥</strong><span>创建时生成，请保存在离线可信位置</span></div><span class="setting-copy"><span>不可再次显示</span></span></div></div></section>`;
+  const storageButtonHidden = !state.storage?.supported || state.storage.persisted;
+  return `<section class="settings-panel ${state.settingPanel === 'security' ? 'active' : ''}" data-panel="security"><h2>安全</h2><p class="panel-intro">主密码不会离开本设备。解锁后密钥只保留在当前会话内存中。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>自动锁定</strong><span>无操作后自动清除解锁密钥</span></div><select class="field inline-select" data-input="lock-minutes"><option value="0" ${state.vault.preferences.lockMinutes === 0 ? 'selected' : ''}>关闭</option><option value="1" ${state.vault.preferences.lockMinutes === 1 ? 'selected' : ''}>1 分钟</option><option value="5" ${state.vault.preferences.lockMinutes === 5 ? 'selected' : ''}>5 分钟</option><option value="15" ${state.vault.preferences.lockMinutes === 15 ? 'selected' : ''}>15 分钟</option><option value="30" ${state.vault.preferences.lockMinutes === 30 ? 'selected' : ''}>30 分钟</option></select></div><div class="setting-row"><div class="setting-copy"><strong>主密码</strong><span>只更新保险库密钥的主密码包装</span></div><button class="secondary-button" data-action="open-change-password">修改</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复密钥</strong><span>创建时生成，请保存在离线可信位置</span></div><span class="setting-copy"><span>不可再次显示</span></span></div><div class="setting-row"><div class="setting-copy"><strong>本地存储保护</strong><span data-storage-detail>${escapeHtml(storageStatusText())}</span></div><button class="secondary-button" data-action="request-storage-persist" ${storageButtonHidden ? 'hidden' : ''}>申请</button></div></div></section>`;
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value < 0) return '';
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+  if (value >= 1024 ** 2) return `${Math.round(value / 1024 ** 2)} MB`;
+  if (value >= 1024) return `${Math.round(value / 1024)} KB`;
+  return `${Math.round(value)} B`;
+}
+
+function storageStatusText() {
+  const storage = state.storage;
+  if (!storage) return '正在检查浏览器存储保护…';
+  if (!storage.supported) return '此浏览器不支持持久化存储申请，请定期导出加密备份。';
+  const usage = storage.usage != null && storage.quota != null
+    ? `已用 ${formatBytes(storage.usage)} / ${formatBytes(storage.quota)}。` : '';
+  return storage.persisted
+    ? `已启用持久化存储，浏览器不会自动清理。${usage}`
+    : `未启用持久化存储，浏览器在空间紧张时可能清除数据。${usage}`;
+}
+
+function updateStorageStatus() {
+  if (!state.storage) return;
+  const detail = storageStatusText();
+  app.querySelectorAll('[data-storage-detail]').forEach((node) => { node.textContent = detail; });
+  app.querySelectorAll('[data-action="request-storage-persist"]').forEach((node) => {
+    node.hidden = !state.storage.supported || state.storage.persisted;
+  });
+}
+
+async function requestStoragePersistence() {
+    if (typeof navigator.storage?.persist !== 'function') return false;
+    try { return await navigator.storage.persist(); } catch { return false; }
+}
+
+async function refreshStorageStatus() {
+  if (typeof navigator.storage?.persisted !== 'function') {
+    state.storage = { supported: false };
+    updateStorageStatus();
+    return;
+  }
+  try {
+    const persisted = await navigator.storage.persisted();
+    let usage = null;
+    let quota = null;
+    if (typeof navigator.storage.estimate === 'function') {
+      const estimate = await navigator.storage.estimate().catch(() => null);
+      if (estimate && Number.isFinite(estimate.usage) && Number.isFinite(estimate.quota)) {
+        usage = estimate.usage;
+        quota = estimate.quota;
+      }
+    }
+    state.storage = { supported: true, persisted, usage, quota };
+  } catch {
+    state.storage = { supported: false };
+  }
+  updateStorageStatus();
 }
 
 function renderAppearanceSettings() {
-  const accentNames = { emerald: '翡翠绿', blue: '蓝', cyan: '青', rose: '玫红', amber: '琥珀', graphite: '石墨灰' };
+  const accentNames = { emerald: '松绿', blue: '靛蓝', cyan: '深青', rose: '绛红', amber: '赭黄', graphite: '石墨' };
   const mode = document.documentElement.dataset.mode || 'system';
   const accent = document.documentElement.dataset.accent || 'emerald';
-  return `<section class="settings-panel ${state.settingPanel === 'appearance' ? 'active' : ''}" data-panel="appearance"><h2>外观</h2><p class="panel-intro">选择显示模式和主题色。偏好仅保存于当前设备。</p><div class="appearance-preview"><div class="mini-app"><div class="mini-side"><span class="mini-mark"></span><span class="mini-line"></span><span class="mini-line"></span></div><div class="mini-content"><strong>密码库</strong><span class="mini-cta">新增密码</span></div></div><div class="preview-text">主题色会用于导航、主要操作、焦点和状态提示。</div></div><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>显示模式</strong><span>按系统偏好或固定浅色/深色</span></div><div class="segmented" role="group" aria-label="显示模式">${[['system','跟随系统'],['light','浅色'],['dark','深色']].map(([value,label]) => `<button class="${mode === value ? 'active' : ''}" data-action="set-mode" data-mode="${value}">${label}</button>`).join('')}</div></div><div class="setting-row"><div class="setting-copy"><strong>主题色</strong><span>${accentNames[accent]}</span></div><div class="swatches" role="group" aria-label="主题色">${Object.entries(accentNames).map(([value,label]) => `<button class="swatch ${accent === value ? 'active' : ''}" data-accent="${value}" data-action="set-accent" title="${label}" aria-label="${label}">${accent === value ? icon('check') : ''}</button>`).join('')}</div></div></div></section>`;
+  return `<section class="settings-panel ${state.settingPanel === 'appearance' ? 'active' : ''}" data-panel="appearance"><h2>外观</h2><p class="panel-intro">显示模式和标识色只保存在当前设备。</p><div class="appearance-preview"><div class="mini-app"><div class="mini-side"><span class="mini-mark"></span><span class="mini-line"></span><span class="mini-line"></span></div><div class="mini-content"><strong>密码库</strong><span class="mini-cta">新增密码</span></div></div><div class="preview-text">标识色只用于应用标记、当前导航、链接和焦点框；主要按钮与状态颜色不受影响。</div></div><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>显示模式</strong><span>按系统偏好或固定浅色 / 深色</span></div><div class="segmented" role="group" aria-label="显示模式">${[['system','跟随系统'],['light','浅色'],['dark','深色']].map(([value,label]) => `<button class="${mode === value ? 'active' : ''}" data-action="set-mode" data-mode="${value}">${label}</button>`).join('')}</div></div><div class="setting-row"><div class="setting-copy"><strong>标识色</strong><span>${accentNames[accent]}</span></div><div class="swatches" role="group" aria-label="标识色">${Object.entries(accentNames).map(([value,label]) => `<button class="swatch ${accent === value ? 'active' : ''}" data-accent="${value}" data-action="set-accent" title="${label}" aria-label="${label}">${accent === value ? icon('check') : ''}</button>`).join('')}</div></div></div></section>`;
 }
 
 function renderCategoriesSettings() {
@@ -380,19 +498,24 @@ function modalTemplate() {
     const cancel = `<button class="secondary-button" type="button" data-action="close-modal">取消</button>`;
     if (modal.type === 'category-filter') {
         const options = [['', '全部分类'], ...state.vault.categories.map((category) => [category, category])];
-        return shell('筛选密码', `<button class="secondary-button" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}">${icon('star')}${state.favoriteOnly ? '显示全部条目' : '仅看收藏'}</button><div class="category-list">${options.map(([value, label]) => `<button class="category-row" data-action="select-category" data-category="${escapeHtml(value)}"><span><i class="category-dot"></i>${escapeHtml(label)}</span>${state.category === value ? icon('check') : ''}</button>`).join('')}</div>`);
+        return shell('筛选密码', `<button class="secondary-button" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}">${icon('star')}<span data-favorite-label>${state.favoriteOnly ? '显示全部条目' : '仅看收藏'}</span></button><div class="category-list">${options.map(([value, label]) => `<button class="category-row" data-action="select-category" data-category="${escapeHtml(value)}"><span><i class="category-dot"></i>${escapeHtml(label)}</span>${state.category === value ? icon('check') : ''}</button>`).join('')}</div>`);
     }
     if (modal.type === 'add' || modal.type === 'edit') {
         const entry = { title: '', username: '', password: '', category: state.vault.categories[0] || '', url: '', notes: '', favorite: false, ...(modal.entry || {}), ...(modal.draft?.values || {}) };
         const categories = [...new Set([...state.vault.categories, entry.category].filter(Boolean))];
-        return shell(modal.type === 'edit' ? '编辑密码' : '新增密码', `<div class="form-grid"><label class="form-field">站点 / 应用<input class="field" name="title" value="${escapeHtml(entry.title)}" required /></label><label class="form-field">分类<select class="field" name="category">${categories.map((category) => `<option ${entry.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select></label><label class="form-field">账户名<input class="field" name="username" value="${escapeHtml(entry.username)}" required /></label><label class="form-field">密码<div class="password-field"><input class="field" name="password" type="password" value="${escapeHtml(entry.password)}" autocomplete="off" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><div class="generator full"><label class="form-field">生成长度<select class="field" data-generator-length>${[16,20,24,32,48,64].map((length) => `<option value="${length}" ${length === 20 ? 'selected' : ''}>${length} 个字符</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="generate-password">${icon('wand-sparkles')}生成随机密码</button><button class="secondary-button" type="button" data-action="copy-generated">${icon('copy')}复制</button></div><label class="form-field full">网址<input class="field" name="url" type="url" value="${escapeHtml(entry.url || '')}" placeholder="https://example.com" /></label><label class="form-field full">备注<textarea class="field" name="notes" placeholder="可选备注">${escapeHtml(entry.notes || '')}</textarea></label><label class="form-field full"><span><input name="favorite" type="checkbox" ${entry.favorite ? 'checked' : ''} /> 收藏此条目</span></label></div>`, `${cancel}<button class="primary-button" type="submit">${icon('save')}保存</button>`, modal.type === 'edit' ? 'edit-entry' : 'add-entry');
+        return shell(modal.type === 'edit' ? '编辑密码' : '新增密码', `<div class="form-grid"><label class="form-field">站点 / 应用<input class="field" name="title" value="${escapeHtml(entry.title)}" required /></label><label class="form-field">分类<select class="field" name="category">${categories.map((category) => `<option ${entry.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select></label><label class="form-field">账户名<input class="field" name="username" value="${escapeHtml(entry.username)}" required /></label><label class="form-field">密码<div class="password-field"><input class="field" name="password" type="password" value="${escapeHtml(entry.password)}" autocomplete="off" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><div class="generator full"><label class="form-field">生成长度<select class="field" data-generator-length>${[16,20,24,32,48,64].map((length) => `<option value="${length}" ${length === 20 ? 'selected' : ''}>${length} 个字符</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="generate-password">${icon('wand-sparkles')}生成随机密码</button><button class="secondary-button" type="button" data-action="copy-generated">${icon('copy')}复制密码</button></div><label class="form-field full">网址<input class="field" name="url" type="url" value="${escapeHtml(entry.url || '')}" placeholder="https://example.com" /></label><label class="form-field full">备注<textarea class="field" name="notes" placeholder="可选备注">${escapeHtml(entry.notes || '')}</textarea></label><label class="form-field full"><span><input name="favorite" type="checkbox" ${entry.favorite ? 'checked' : ''} /> 收藏此条目</span></label></div>`, `${cancel}<button class="primary-button" type="submit">${icon('save')}保存</button>`, modal.type === 'edit' ? 'edit-entry' : 'add-entry');
     }
     if (modal.type === 'detail') {
         const entry = state.vault.entries.find((item) => item.id === modal.id);
         if (!entry) return '';
         const id = escapeHtml(entry.id);
         const url = safeWebUrl(entry.url);
-        return shell(entry.title, `<dl><div class="detail-row"><dt>账户</dt><dd>${escapeHtml(entry.username)} <button class="icon-button" data-action="copy-account" data-id="${id}" aria-label="复制账户">${icon('copy')}</button></dd></div><div class="detail-row"><dt>网址</dt><dd>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">打开网站 ${icon('external-link')}</a>` : escapeHtml(entry.url || '未设置')}</dd></div><div class="detail-row"><dt>分类</dt><dd>${escapeHtml(entry.category)}</dd></div><div class="detail-row"><dt>更新时间</dt><dd>${new Date(entry.updatedAt).toLocaleString('zh-CN')}</dd></div>${entry.notes ? `<div class="detail-row"><dt>备注</dt><dd>${escapeHtml(entry.notes)}</dd></div>` : ''}</dl><div class="secret"><span class="secret-value" data-secret-value>${modal.revealed ? escapeHtml(entry.password) : '••••••••••••••••'}</span><button class="icon-button" data-action="reveal-password" aria-label="${modal.revealed ? '隐藏密码' : '显示密码'}" aria-pressed="${Boolean(modal.revealed)}">${icon(modal.revealed ? 'eye-off' : 'eye')}</button></div>`, `<button class="secondary-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}删除</button><button class="secondary-button" data-action="open-edit" data-id="${id}">${icon('pencil')}编辑</button><button class="primary-button" data-action="copy-password" data-id="${id}">${icon('copy')}复制密码</button>`);
+        const host = hostOf(entry);
+        // The secret leads: it is what this screen exists for, and it sits on the
+        // app's one dark surface so nothing competes with reading it.
+        const plate = `<div class="plate secret"><span class="secret-value plate-value" data-secret-value>${modal.revealed ? escapeHtml(entry.password) : '••••••••••••••••'}</span><button class="icon-button" data-action="reveal-password" aria-label="${modal.revealed ? '隐藏密码' : '显示密码'}" aria-pressed="${Boolean(modal.revealed)}">${icon(modal.revealed ? 'eye-off' : 'eye')}</button><button class="primary-button" data-action="copy-password" data-id="${id}">${icon('copy')}复制</button></div>`;
+        const rows = `<div class="detail-row"><dt>账户</dt><dd class="detail-inline"><span>${escapeHtml(entry.username || '未设置')}</span><button class="icon-button" data-action="copy-account" data-id="${id}" title="复制账户" aria-label="复制账户">${icon('copy')}</button></dd></div><div class="detail-row"><dt>网址</dt><dd>${url ? `<a class="detail-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><span class="detail-host">${escapeHtml(host)}</span>${icon('external-link')}</a>` : escapeHtml(entry.url || '未设置')}</dd></div><div class="detail-row"><dt>分类</dt><dd>${escapeHtml(entry.category || '未分类')}</dd></div><div class="detail-row"><dt>更新时间</dt><dd class="detail-when">${new Date(entry.updatedAt).toLocaleString('zh-CN')}</dd></div>${entry.notes ? `<div class="detail-row"><dt>备注</dt><dd class="detail-note">${escapeHtml(entry.notes)}</dd></div>` : ''}`;
+        return shell(entry.title, `${plate}<dl>${rows}</dl>`, `<button class="danger-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}删除</button><button class="secondary-button" data-action="open-edit" data-id="${id}">${icon('pencil')}编辑</button>`);
     }
     if (modal.type === 'sync') {
         const first = !state.record.remoteSha;
@@ -417,7 +540,7 @@ function modalTemplate() {
     if (modal.type === 'sync-config') {
         const sync = { ...state.vault.sync, ...(modal.configDraft || {}) };
         const step = modal.step || 1;
-        return shell('连接 GitHub 私有仓库', `<ol class="wizard-steps"><li ${step === 1 ? 'aria-current="step"' : ''}>仓库</li><li ${step === 2 ? 'aria-current="step"' : ''}>访问令牌</li><li>首次连接</li></ol><div ${step !== 1 ? 'hidden' : ''}><label class="form-field">仓库地址<input class="field" name="repositoryUrl" type="url" value="${escapeHtml(sync.owner && sync.repo ? `https://github.com/${sync.owner}/${sync.repo}` : '')}" placeholder="https://github.com/owner/private-vault" /></label><p class="form-help">使用你创建的私有仓库，密码库只上传密文。</p><details><summary>高级设置</summary><div class="form-stack"><label class="form-field">所有者<input class="field" name="owner" value="${escapeHtml(sync.owner)}" /></label><label class="form-field">仓库名<input class="field" name="repo" value="${escapeHtml(sync.repo)}" /></label><label class="form-field">分支<input class="field" name="branch" value="${escapeHtml(sync.branch || 'main')}" /></label><label class="form-field">密文文件路径<input class="field" name="path" value="${escapeHtml(sync.path || 'passwmana.vault')}" /></label></div></details></div><div ${step !== 2 ? 'hidden' : ''}><p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 Fine-grained PAT</a>：仅选此私有仓库，授予 Contents 读写权限，并设置有效期。</p><label class="form-field">Fine-grained PAT<div class="password-field"><input class="field" name="token" type="password" value="${escapeHtml(sync.token)}" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-password" aria-label="显示令牌">${icon('eye')}</button></div></label><button class="secondary-button sync-backup" type="button" data-action="test-sync-connection">${icon('plug')}测试连接</button><p role="status" data-connection-result>${escapeHtml(modal.connectionResult || '验证仓库、分支和当前令牌的读写权限。')}</p></div>`, `${cancel}${step === 1 ? '<button class="primary-button" type="button" data-action="wizard-next">下一步</button>' : '<button class="secondary-button" type="button" data-action="wizard-back">上一步</button><button class="primary-button" type="submit">保存并完成连接</button>'}`, 'sync-config');
+        return shell('连接 GitHub 私有仓库', `<ol class="wizard-steps"><li ${step === 1 ? 'aria-current="step"' : ''}>仓库</li><li ${step === 2 ? 'aria-current="step"' : ''}>访问令牌</li><li>首次连接</li></ol><div ${step !== 1 ? 'hidden' : ''}><label class="form-field">仓库地址<input class="field" name="repositoryUrl" type="url" value="${escapeHtml(sync.owner && sync.repo ? `https://github.com/${sync.owner}/${sync.repo}` : '')}" placeholder="https://github.com/owner/private-vault" /></label><p class="form-help">使用你创建的私有仓库，密码库只上传密文。</p><details><summary>高级设置</summary><div class="form-stack"><label class="form-field">分支<input class="field" name="branch" value="${escapeHtml(sync.branch || 'main')}" /></label><label class="form-field">密文文件路径<input class="field" name="path" value="${escapeHtml(sync.path || 'passwmana.vault')}" /></label></div></details></div><div ${step !== 2 ? 'hidden' : ''}><p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 Fine-grained PAT</a>：仅选此私有仓库，授予 Contents 读写权限，并设置有效期。</p><label class="form-field">Fine-grained PAT<div class="password-field"><input class="field" name="token" type="password" value="${escapeHtml(sync.token)}" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-password" aria-label="显示令牌">${icon('eye')}</button></div></label><button class="secondary-button sync-backup" type="button" data-action="test-sync-connection">${icon('plug')}测试连接</button><p role="status" data-connection-result>${escapeHtml(modal.connectionResult || '验证仓库、分支和当前令牌的读写权限。')}</p></div>`, `${cancel}${step === 1 ? '<button class="primary-button" type="button" data-action="wizard-next">下一步</button>' : '<button class="secondary-button" type="button" data-action="wizard-back">上一步</button><button class="primary-button" type="submit">保存并完成连接</button>'}`, 'sync-config');
     }
     if (modal.type === 'change-password') return shell('修改主密码', '<p>新主密码会同步到其他设备；并发修改时会要求选择版本。</p><div class="form-stack"><label class="form-field">当前主密码<input class="field" name="currentPassword" type="password" autocomplete="current-password" required /></label><label class="form-field">新主密码<input class="field" name="newPassword" type="password" autocomplete="new-password" minlength="12" required aria-describedby="new-password-help" /></label><p class="form-help" id="new-password-help" data-password-strength>建议使用独有的长密码短语。</p><label class="form-field">确认新主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label></div>', `${cancel}<button class="primary-button" type="submit">保存新密码</button>`, 'change-password');
     if (modal.type === 'recovery-reset') return shell('使用恢复密钥', '<p>恢复密钥在本机验证；重设的主密码会随保险库同步到其他设备。请先锁定其他打开的标签页。</p><div class="form-stack"><label class="form-field">恢复密钥<input class="field" name="recoveryCode" autocomplete="off" required /></label><label class="form-field">新主密码<input class="field" name="newPassword" type="password" minlength="12" autocomplete="new-password" required /></label><label class="form-field">确认新主密码<input class="field" name="confirmPassword" type="password" minlength="12" autocomplete="new-password" required /></label></div>', `${cancel}<button class="primary-button" type="submit">验证并重设主密码</button>`, 'recovery-reset');
@@ -426,14 +549,43 @@ function modalTemplate() {
 
 function renderApp() {
   const title = state.view === 'vault' ? '密码库' : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
+  const status = syncStatus();
+  const minutes = state.vault.preferences.lockMinutes;
   const nav = `<nav class="main-nav"><button class="nav-link ${state.view === 'vault' ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}密码库</button><button class="nav-link ${state.view === 'settings' ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}设置</button></nav>`;
-  app.innerHTML = `<div class="app-shell"><aside class="side-nav"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="${state.settingsDetail ? '返回设置' : '打开导航'}" aria-label="${state.settingsDetail ? '返回设置' : '打开导航'}">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><div class="mobile-header-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></div></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync" data-sync-status="${syncStatus().status}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(syncStatus().label)}</span>${icon('refresh-cw')}</button></div></header><div class="page">${state.savedDraft ? '<div class="notice draft-notice"><span>有一份未完成的密码编辑</span><div class="empty-actions"><button class="secondary-button" data-action="resume-draft">继续编辑</button><button class="secondary-button" data-action="discard-draft">放弃草稿</button></div></div>' : ''}${state.updateReady ? '<div class="notice"><span>新版本已准备好</span><button class="secondary-button" data-action="apply-update">保存草稿并更新</button></div>' : ''}${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}"><div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div>${nav}<div class="nav-footer"><span class="avatar">PM</span><div><strong>本地保险库</strong><span>已解锁</span></div></div></aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap" role="status" aria-live="polite" aria-atomic="true"></div>`;
+  const identity = `<div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><div class="brand-note">本机保险库</div>`;
+  const footer = `<div class="nav-footer"><button class="nav-status" data-action="open-sync" data-sync-status="${status.status}"><span data-sync-icon>${icon(status.icon, state.syncing ? 'is-spinning' : '')}</span><span data-sync-label>${escapeHtml(status.label)}</span></button><span class="nav-countdown">${minutes ? `闲置 ${minutes} 分钟后锁定` : '自动锁定已关闭'}</span></div>`;
+  app.innerHTML = `<div class="app-shell"><aside class="side-nav">${identity}${nav}${footer}</aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="${state.settingsDetail ? '返回设置' : '打开导航'}" aria-label="${state.settingsDetail ? '返回设置' : '打开导航'}">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><div class="mobile-header-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></div></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync" data-sync-status="${status.status}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(status.label)}</span>${icon('refresh-cw')}</button></div></header><div class="page">${state.savedDraft ? '<div class="notice draft-notice"><span>有一份未完成的密码编辑</span><div class="empty-actions"><button class="secondary-button" data-action="resume-draft">继续编辑</button><button class="secondary-button" data-action="discard-draft">放弃草稿</button></div></div>' : ''}${state.updateReady ? '<div class="notice"><span>新版本已准备好</span><button class="secondary-button" data-action="apply-update">保存草稿并更新</button></div>' : ''}${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}">${identity}${nav}${footer}</aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap" role="status" aria-live="polite" aria-atomic="true"></div>`;
   queueMicrotask(drawIcons);
 }
 
 function drawIcons() {
   if (window.lucide) window.lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
 }
+
+const darkScheme = window.matchMedia?.('(prefers-color-scheme: dark)');
+
+function readPreference(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function writePreference(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* Theme persistence is optional. */ }
+}
+
+function effectiveDarkMode() {
+    const mode = document.documentElement.dataset.mode || 'system';
+    return mode === 'dark' || (mode === 'system' && Boolean(darkScheme?.matches));
+}
+
+function applyThemeColor() {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+    const styles = getComputedStyle(document.documentElement);
+    const color = (effectiveDarkMode() ? styles.getPropertyValue('--paper') : styles.getPropertyValue('--ink')).trim();
+    if (color) meta.content = color;
+}
+
+darkScheme?.addEventListener?.('change', applyThemeColor);
 
 function render() {
     const hadDialog = Boolean(activeDialog);
@@ -444,6 +596,13 @@ function render() {
     activeDialog = enhanceDialogs(app, { drawerOpen: state.drawerOpen, trigger: hadDialog && !state.modal ? dialogTrigger : null });
     for (const form of app.querySelectorAll('form[data-form]')) initialFormValues.set(form, JSON.stringify(formValues(form)));
     if (!activeDialog && hadDialog) dialogTrigger = null;
+    updateStorageStatus();
+    applyThemeColor();
+    if (!activeDialog && !state.vaultKey) {
+        // Dynamic autofocus is unreliable across browsers; focus the first field
+        // explicitly so locking or reloading lands on the unlock form.
+        queueMicrotask(() => app.querySelector('form[data-form="unlock"] input[name="password"], form[data-form="setup"] input[name="password"]')?.focus());
+    }
     queueMicrotask(drawIcons);
 }
 
@@ -464,10 +623,31 @@ function toast(message) {
   setTimeout(() => node.remove(), 2600);
 }
 
-async function copyText(value, message = '已复制；30 秒后尝试清除，后续复制的内容会保留') {
+async function copyText(value, message = '已复制；30 秒后尝试清除，后续复制的内容会保留', options = {}) {
     if (!navigator.clipboard?.writeText) throw new Error('此浏览器无法访问剪贴板，请手动选择并复制');
-    await clipboardManager.copy(value);
+    await clipboardManager.copy(value, { clearAfter: CLIPBOARD_CLEAR_MS, ...options });
     toast(message);
+}
+
+function hideRevealedPassword() {
+    clearTimeout(state.revealTimer);
+    state.revealTimer = null;
+    if (state.modal?.type !== 'detail' || !state.modal.revealed) return;
+    state.modal.revealed = false;
+    const secret = app.querySelector('[data-secret-value]');
+    if (secret) secret.textContent = '••••••••••••••••';
+    const control = app.querySelector('[data-action="reveal-password"]');
+    if (control) {
+        control.setAttribute('aria-label', '显示密码');
+        control.setAttribute('aria-pressed', 'false');
+        control.innerHTML = icon('eye');
+        drawIcons();
+    }
+}
+
+function scheduleRevealHide() {
+    clearTimeout(state.revealTimer);
+    state.revealTimer = setTimeout(hideRevealedPassword, REVEAL_TIMEOUT_MS);
 }
 
 async function downloadBackup() {
@@ -495,7 +675,7 @@ async function importBackup() {
         const file = input.files?.[0];
         if (!file) return;
         try {
-            if (file.size > 20 * 1024 * 1024) throw new Error('备份文件过大，请选择小于 20 MB 的文件');
+            if (file.size > MAX_IMPORT_BYTES) throw new Error('备份文件过大，请选择小于 20 MB 的文件');
             const data = JSON.parse(await file.text());
             validateEncryptedRecord(data.record || data);
             state.modal = { type: 'backup-unlock', data };
@@ -513,6 +693,7 @@ async function importLegacyBackup() {
     const file = input.files?.[0];
     if (!file) return;
     try {
+      if (file.size > MAX_IMPORT_BYTES) throw new Error('旧版备份过大，请选择小于 20 MB 的文件');
       const data = JSON.parse(await file.text());
       if (data.format === 'passwmana-v1' || data.record?.format === 'passwmana-v1') {
         throw new Error('这是新版加密备份，请使用“恢复加密备份”');
@@ -521,6 +702,9 @@ async function importLegacyBackup() {
       const confirmed = confirm('旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？');
       if (!confirmed) return;
       const converted = convertLegacyBackup(data, state.vault);
+      // Validate the merged shape before replacing memory or storage. A bad
+      // legacy field must fail here, not on the next unlock.
+      validateVault({ ...state.vault, entries: converted.entries, categories: converted.categories });
       state.vault.entries = converted.entries;
       state.vault.categories = converted.categories;
       await persistVault();
@@ -556,7 +740,6 @@ function stopSyncSession() {
     state.syncController = null;
     state.syncPromise = null;
     state.syncing = null;
-    state.syncAttempt = null;
     state.syncBlocked = false;
     state.syncRetryCount = 0;
     state.syncRetryAt = 0;
@@ -586,10 +769,12 @@ function assertSyncSession(session) {
     if (session !== state.session || !state.vaultKey) throw new DOMException('同步已取消', 'AbortError');
 }
 
-async function remoteRequest(method, sync, body, { repository = false } = {}) {
+async function remoteRequest(method, sync, body, { repository = false, blob = '' } = {}) {
     const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
     const root = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}`;
-    const url = repository ? root : `${root}/contents/${encodedPath}${method === 'GET' ? `?ref=${encodeURIComponent(sync.branch)}` : ''}`;
+    const url = blob ? `${root}/git/blobs/${encodeURIComponent(blob)}`
+        : repository ? root
+            : `${root}/contents/${encodedPath}${method === 'GET' ? `?ref=${encodeURIComponent(sync.branch)}` : ''}`;
     const controller = new AbortController();
     const sessionSignal = state.syncController?.signal;
     const abort = () => controller.abort();
@@ -602,7 +787,7 @@ async function remoteRequest(method, sync, body, { repository = false } = {}) {
             headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (response.status === 404 && method === 'GET' && !repository) return null;
+        if (response.status === 404 && method === 'GET' && !repository && !blob) return null;
         const result = await response.json().catch(() => ({}));
         if (!response.ok) {
             const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
@@ -637,7 +822,6 @@ function isRetryableSyncError(error) {
 async function withSyncRetry(operation, session = state.session) {
     for (let attempt = 1; attempt <= MAX_SYNC_ATTEMPTS; attempt += 1) {
         assertSyncSession(session);
-        state.syncAttempt = attempt;
         refreshSyncStatus();
         try {
             return await operation();
@@ -649,6 +833,19 @@ async function withSyncRetry(operation, session = state.session) {
             await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
         }
     }
+}
+
+async function readRemoteFile(sync, remote) {
+    if (!remote) return remote;
+    if (typeof remote.content === 'string' && remote.content.trim()) return remote;
+    // The contents endpoint omits inline content for files larger than 1 MB and
+    // returns encoding "none". The Git Data blobs endpoint still serves them.
+    if (!remote.sha) return remote;
+    const blob = await remoteRequest('GET', sync, undefined, { blob: remote.sha });
+    if (!blob || typeof blob.content !== 'string' || !blob.content.trim()) {
+        throw syncError('远端密文为空、过大或无法读取，请检查仓库文件', 'format');
+    }
+    return { ...remote, content: blob.content };
 }
 
 function decodeRemote(remote) {
@@ -721,7 +918,7 @@ async function synchronizeOnce(sync, mode, session, resolution) {
         if (repository.private !== true) throw syncError('请选择私有仓库保存加密保险库', 'repository');
         state.verifiedSyncTarget = target;
     }
-    const remote = await remoteRequest('GET', sync);
+    const remote = await readRemoteFile(sync, await remoteRequest('GET', sync));
     assertSyncSession(session);
     await storageQueue;
     assertSyncSession(session);
@@ -784,6 +981,9 @@ async function synchronizeOnce(sync, mode, session, resolution) {
                     ? '两端的主密码设置不同，已暂停同步。请查看冲突并确认所有设备应使用哪一版主密码。'
                     : '两台设备修改了相同字段。请查看冲突并逐项选择保留的版本。', 'conflict');
             }
+            // The merged result is the only vault this device will store; make
+            // sure a merge bug cannot encrypt an unopenable shape.
+            validateVault(merged);
             await applyRemoteVault(merged, payload, remote.sha, dirty, revision, session, keyMerge.metadata);
         } else if (!state.record.syncBase || !state.record.syncKeyBase) {
             await queueStorage(async () => {
@@ -835,7 +1035,6 @@ async function synchronize({ automatic = false, mode = 'sync', resolution } = {}
     const sync = { ...state.vault.sync };
     state.syncController = new AbortController();
     state.syncing = mode === 'pull' ? 'pull' : 'sync';
-    state.syncAutomatic = automatic;
     state.syncLastError = null;
     state.syncBlocked = false;
     clearTimeout(state.syncTimer);
@@ -872,8 +1071,6 @@ async function synchronize({ automatic = false, mode = 'sync', resolution } = {}
         } finally {
             if (session === state.session) {
                 state.syncing = null;
-                state.syncAttempt = null;
-                state.syncAutomatic = false;
                 state.syncPromise = null;
                 state.syncController = null;
                 if (state.pendingRemote) render();
@@ -1039,7 +1236,7 @@ async function handleSubmit(event) {
     }
     if (form.dataset.form === 'sync-config') {
       const previous = state.vault.sync;
-      const next = { owner: values.get('owner').trim(), repo: values.get('repo').trim(), branch: values.get('branch').trim(), path: values.get('path').trim().replace(/^\/+|\/+$/g, ''), token: values.get('token').trim(), automatic: previous.automatic !== false };
+      const next = { ...syncConfigFromForm(form), automatic: previous.automatic !== false };
       if (!syncConfigured(next)) throw new Error('请完整填写仓库、分支、路径与令牌');
       const targetChanged = ['owner', 'repo', 'branch', 'path'].some((key) => previous[key] !== next[key]);
       stopSyncSession();
@@ -1143,6 +1340,8 @@ function persistEntryDraft() {
 }
 
 async function closeModal() {
+    clearTimeout(state.revealTimer);
+    state.revealTimer = null;
     const form = app.querySelector('form[data-form="add-entry"], form[data-form="edit-entry"]');
     if (form) {
         if ((state.formDraft || JSON.stringify(formValues(form)) !== initialFormValues.get(form)) && !confirm('放弃这次未保存的编辑？')) return;
@@ -1158,8 +1357,13 @@ async function closeModal() {
 
 function syncConfigFromForm(form) {
     const values = formValues(form);
-    const repository = parseGithubRepository(values.repositoryUrl);
-    return { ...repository, repositoryUrl: values.repositoryUrl, branch: values.branch.trim() || 'main', path: values.path.trim().replace(/^\/+|\/+$/g, '') || 'passwmana.vault', token: values.token.trim() };
+    const repository = parseGithubRepository(values.repositoryUrl || '');
+    return {
+        ...repository,
+        branch: String(values.branch || '').trim() || 'main',
+        path: String(values.path || '').trim().replace(/^\/+|\/+$/g, '') || 'passwmana.vault',
+        token: String(values.token || '').trim(),
+    };
 }
 
 async function testSyncConnection(form) {
@@ -1215,7 +1419,12 @@ async function setupServiceWorker() {
 function pruneTrash() {
   const cutoff = Date.now() - 30 * 86400000;
   const originalLength = state.vault.trash.length;
-  state.vault.trash = state.vault.trash.filter((entry) => new Date(entry.deletedAt).getTime() > cutoff);
+  // Keep entries without a valid timestamp: imported or legacy records may not
+  // have one, and an accidental permanent deletion cannot be undone.
+  state.vault.trash = state.vault.trash.filter((entry) => {
+    const deletedAt = Date.parse(entry.deletedAt);
+    return !Number.isFinite(deletedAt) || deletedAt > cutoff;
+  });
   if (state.vault.trash.length !== originalLength) persistVault().catch(() => {});
 }
 
@@ -1243,7 +1452,7 @@ async function handleAction(event) {
     return;
   }
   if (action === 'copy-generated') { await copyText(control.closest('form').elements.password.value); return; }
-  if (action === 'copy-account') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.username); return; }
+  if (action === 'copy-account') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.username, '账户已复制', { clearAfter: 0 }); return; }
   if (action === 'open-conflicts') { if (!state.syncConflict) return toast('当前没有待处理的冲突'); state.modal = { type: 'conflicts' }; render(); return; }
   if (action === 'reveal-conflict') {
     const conflict = state.syncConflict?.conflicts[Number(control.dataset.index)];
@@ -1271,7 +1480,22 @@ async function handleAction(event) {
     render(); return;
   }
   if (action === 'restore-previous') { if (!await getRollbackRecord()) return toast('此设备没有可回滚的保险库'); state.modal = { type: 'backup-unlock', rollback: true }; render(); return; }
-  if (action === 'check-update') { await state.serviceWorkerRegistration?.update(); toast(state.updateReady ? '新版本已准备好' : '已检查应用更新'); return; }
+  if (action === 'request-storage-persist') {
+    if (typeof navigator.storage?.persist !== 'function') return toast('此浏览器不支持持久化存储申请');
+    const granted = await requestStoragePersistence();
+    await refreshStorageStatus();
+    toast(granted ? '已启用持久化存储' : '浏览器未授予持久化存储，请定期导出加密备份');
+    return;
+  }
+  if (action === 'check-update') {
+    if (!state.serviceWorkerRegistration) return toast('此浏览器不支持应用更新检查');
+    try { await state.serviceWorkerRegistration.update(); }
+    catch { return toast('无法检查更新，请检查网络连接'); }
+    if (state.updateReady) toast('新版本已准备好');
+    else if (state.serviceWorkerRegistration.installing) toast('正在下载新版本，完成后会提示');
+    else toast('已检查应用更新');
+    return;
+  }
   if (action === 'apply-update') {
     const worker = state.serviceWorkerRegistration?.waiting;
     if (!worker) return toast('当前没有等待安装的更新');
@@ -1291,15 +1515,23 @@ async function handleAction(event) {
     drawIcons();
     return;
   }
-  if (action === 'copy-recovery') { await copyText(control.dataset.code, '恢复密钥已复制'); return; }
+  if (action === 'copy-recovery') { await copyText(control.dataset.code, '恢复密钥已复制；2 分钟后尝试清除', { clearAfter: 120000 }); return; }
   if (action === 'open-recovery-reset') { state.modal = { type: 'recovery-reset' }; render(); return; }
   if (action === 'view') { state.view = control.dataset.viewName; state.settingsDetail = false; state.drawerOpen = false; render(); return; }
   if (action === 'mobile-left') { dialogTrigger = { action: 'mobile-left' }; if (state.settingsDetail) { state.settingsDetail = false; render(); } else { state.drawerOpen = true; render(); } return; }
   if (action === 'close-drawer') { state.drawerOpen = false; render(); return; }
-  if (action === 'setting-panel') { state.settingPanel = control.dataset.panel; if (window.matchMedia('(max-width: 899px)').matches) state.settingsDetail = true; render(); return; }
-  if (action === 'set-mode') { document.documentElement.dataset.mode = control.dataset.mode; localStorage.setItem('passwmana-mode', control.dataset.mode); render(); return; }
-  if (action === 'set-accent') { document.documentElement.dataset.accent = control.dataset.accent; localStorage.setItem('passwmana-accent', control.dataset.accent); document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.documentElement).getPropertyValue('--primary').trim(); render(); return; }
-  if (action === 'toggle-favorite-filter') { state.favoriteOnly = !state.favoriteOnly; control.classList.toggle('active', state.favoriteOnly); control.setAttribute('aria-pressed', String(state.favoriteOnly)); if (state.modal?.type === 'category-filter') control.textContent = state.favoriteOnly ? '显示全部条目' : '仅看收藏'; updateVaultList(); return; }
+  if (action === 'setting-panel') { state.settingPanel = control.dataset.panel; if (window.matchMedia('(max-width: 899px)').matches) state.settingsDetail = true; if (state.settingPanel === 'security') void refreshStorageStatus(); render(); return; }
+  if (action === 'set-mode') { document.documentElement.dataset.mode = control.dataset.mode; writePreference('passwmana-mode', control.dataset.mode); applyThemeColor(); render(); return; }
+  if (action === 'set-accent') { document.documentElement.dataset.accent = control.dataset.accent; writePreference('passwmana-accent', control.dataset.accent); render(); return; }
+  if (action === 'toggle-favorite-filter') {
+    state.favoriteOnly = !state.favoriteOnly;
+    control.classList.toggle('active', state.favoriteOnly);
+    control.setAttribute('aria-pressed', String(state.favoriteOnly));
+    const label = control.querySelector('[data-favorite-label]');
+    if (label) label.textContent = state.favoriteOnly ? '显示全部条目' : '仅看收藏';
+    updateVaultList();
+    return;
+  }
   if (action === 'open-category-filter') { state.modal = { type: 'category-filter' }; render(); return; }
   if (action === 'select-category') { state.category = control.dataset.category; state.modal = null; render(); return; }
   if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
@@ -1313,6 +1545,8 @@ async function handleAction(event) {
     control.setAttribute('aria-label', state.modal.revealed ? '隐藏密码' : '显示密码');
     control.setAttribute('aria-pressed', String(state.modal.revealed));
     control.innerHTML = icon(state.modal.revealed ? 'eye-off' : 'eye');
+    if (state.modal.revealed) scheduleRevealHide();
+    else { clearTimeout(state.revealTimer); state.revealTimer = null; }
     drawIcons();
     return;
   }
@@ -1385,7 +1619,7 @@ window.addEventListener('beforeunload', (event) => {
     if (form && JSON.stringify(formValues(form)) !== initialFormValues.get(form) && !updateRequested) { event.preventDefault(); event.returnValue = ''; }
 });
 
-for (const eventName of ['pointerdown', 'keydown', 'touchstart']) document.addEventListener(eventName, resetLockTimer, { passive: true });
+for (const eventName of ['pointerdown', 'keydown', 'touchstart', 'wheel']) document.addEventListener(eventName, resetLockTimer, { passive: true });
 window.addEventListener('online', () => { refreshSyncStatus(); scheduleAutoSync(0); });
 window.addEventListener('offline', refreshSyncStatus);
 window.addEventListener('focus', () => scheduleAutoSync(0));
@@ -1393,11 +1627,15 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 window.addEventListener('resize', () => { if (!window.matchMedia('(max-width: 899px)').matches && state.settingsDetail) { state.settingsDetail = false; render(); } });
 
 async function bootstrap() {
-  document.documentElement.dataset.mode = localStorage.getItem('passwmana-mode') || 'system';
-  document.documentElement.dataset.accent = localStorage.getItem('passwmana-accent') || 'emerald';
+  document.documentElement.dataset.mode = readPreference('passwmana-mode') || 'system';
+  document.documentElement.dataset.accent = readPreference('passwmana-accent') || 'emerald';
+  applyThemeColor();
   state.record = await dbGet();
   render();
   void setupServiceWorker();
+  // Ask early, before the browser decides this origin is disposable. Browsers
+  // that require a user gesture can still grant it from Settings > Security.
+  void requestStoragePersistence().finally(() => refreshStorageStatus());
 }
 
 bootstrap().catch((error) => { app.textContent = `无法初始化保险库: ${error.message}`; });

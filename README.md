@@ -14,7 +14,7 @@ Open the reported URL. Creating a vault generates a recovery key once; save it o
 
 The app still requires no bundler or server. Cryptography and storage are in `vault-core.js`, pure sync merging is in `sync-core.js`, and interaction helpers are in `ui-helpers.js`. The pinned Lucide script and license are served locally from `vendor/`.
 
-Legacy plaintext JSON backups from the React version can be merged from Settings > Sync and Backup > Migrate Legacy Backup. Migration happens locally and immediately re-encrypts valid entries; securely delete the old plaintext file after verification.
+Legacy plaintext JSON backups from the React version can be merged from Settings > Sync and Backup > Migrate Legacy Backup. Migration happens locally and immediately re-encrypts valid entries; securely delete the old plaintext file after verification. Entries whose ID is already in the trash are skipped, so re-running a migration never recreates a deleted record or duplicates an ID. The merged vault is validated before anything is written.
 
 ## Deploy to GitHub Pages
 
@@ -41,12 +41,13 @@ The HTML uses a Content Security Policy restricting scripts and styles to local 
 - Imported records are structurally validated and actually decrypted before replacement. A single IndexedDB transaction preserves the previous encrypted vault for **Restore previous vault**; rollback requires that previous vault's password.
 - Entry IDs and imported text are escaped in HTML. Website links accept only HTTP/HTTPS URLs without embedded credentials.
 - Unfinished entry forms are stored as separate encrypted drafts bound to the vault key. They stay local, never enter backups or sync uploads, and can be resumed after unlocking. Locking clears the unlocked vault and plaintext form state.
+- The app asks the browser for persistent storage at startup so the encrypted IndexedDB copy is less likely to be evicted under disk pressure. Settings > Security reports the current protection and usage, and can retry the request where a user gesture is required.
 
 ## Everyday use
 
 The mobile header includes **Lock now**. Entry forms offer cryptographically random passwords from 12 to 64 characters (the interface presets start at 16), and details offer account/password copying and safe website links. Modal dialogs move and contain keyboard focus, support Escape, and return focus when closed; edited entry forms ask before discarding changes. Validation stays beside the form, and an idle warning appears before automatic locking.
 
-Copying again restarts the 30-second cleanup timer. Cleanup only clears the clipboard if read permission is already granted and the value still matches the copied text. It never requests read permission on the timer; if the browser cannot safely check the value, it leaves the clipboard unchanged.
+Copying again restarts the 30-second cleanup timer. Cleanup only clears the clipboard if read permission is already granted and the value still matches the copied text. It never requests read permission on the timer; if the browser cannot safely check the value, it leaves the clipboard unchanged. Account names are copied without a cleanup timer, and recovery keys use a two-minute window so they can be pasted into a password manager. A revealed password hides itself after 30 seconds.
 
 ## GitHub sync
 
@@ -60,6 +61,8 @@ After that, background sync runs on unlock, about two seconds after saving, when
 Unrelated entry changes, including changes to different fields of one entry, are merged using the encrypted last-synced baseline. Trash moves, restores, permanent deletions, categories, and preferences participate. Conflicting changes to the same field stop the upload and preserve local data. **Review conflicts** shows both versions and lets you choose each field; passwords stay hidden until requested. Applying choices reads the remote SHA again and refuses stale choices. Export a backup before choosing a version or using **Use remote version**, which replaces local entries. There is no automatic last-write-wins overwrite.
 
 Devices sharing a vault also share its master-password and recovery-key wrapping version. Password wrappers have a separate local merge baseline: a remote password change is adopted, ordinary entry uploads cannot revert it, and simultaneous password changes require an explicit complete version choice. Older records missing that wrapping baseline stop if versions differ rather than guessing. After choosing the remote version, use that device's password on your next unlock. Restoring with a recovery key obtains the same cross-tab lock and rereads the latest database record before saving.
+
+The contents API omits inline content for files larger than 1 MB, so the app reads those revisions through the Git data blobs endpoint instead; a single repository file remains subject to GitHub's own size limit. Uploads still use the contents API with the exact SHA that was read and merged.
 
 Offline edits stay encrypted in IndexedDB. Transient failures retry up to three times, then back off for later background retries; GitHub rate-limit headers are respected. Authentication, configuration, format, and merge errors remain visible in the sync status until addressed or manually retried. Changing the repository, branch, or path and restoring a backup require a fresh first connection.
 

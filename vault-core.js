@@ -19,8 +19,11 @@ function formatError(message) {
 
 function isPlainObject(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    // Plain objects from another realm (an iframe, a vm context, or a structured
+    // clone) do not share this realm's Object.prototype, but their prototype
+    // chain still ends at null one link later.
     const prototype = Object.getPrototypeOf(value);
-    return prototype === Object.prototype || prototype === null;
+    return prototype === null || Object.getPrototypeOf(prototype) === null;
 }
 
 function assertObject(value, label) {

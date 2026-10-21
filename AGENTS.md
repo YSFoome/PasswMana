@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-PasswMana is a zero-build static PWA. `index.html` loads `styles.css` and `app.js`; `manifest.webmanifest`, `sw.js`, and `icon.svg` provide install and offline behavior. The standalone `pwa-prototype.html` is a layout reference, not production code. Do not add server-side code or put encrypted vault data in this repository.
+PasswMana is a zero-build static PWA. `index.html` loads `styles.css` and `app.js`; `manifest.webmanifest`, `sw.js`, and `icon.svg` provide install and offline behavior. Do not add server-side code or put encrypted vault data in this repository.
 
 ## Local Development
 

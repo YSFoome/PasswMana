@@ -37,7 +37,7 @@ function scriptWithModuleMocks(source) {
         const moduleSource = fs.readFileSync(modulePath, 'utf8');
         const exportedNames = [...moduleSource.matchAll(/export\s+(?:async\s+)?(?:function|const|let|class)\s+(\w+)/g)].map((match) => match[1]);
         const body = moduleSource.replace(/\bexport\s+(?=(?:async\s+)?(?:function|const|let|class)\b)/g, '');
-        return `let { ${bindings} } = (() => { ${body}\nreturn { ${exportedNames.join(', ')} }; })();`;
+        return `let { ${bindings} } = ((globalThis.__testModules ??= {})[${JSON.stringify(relativePath)}] ??= (() => { ${body}\nreturn { ${exportedNames.join(', ')} }; })());`;
     });
 }
 
@@ -86,14 +86,14 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
         async fetch(url, options = {}) {
             const request = { url: String(url), ...options, body: options.body ? JSON.parse(options.body) : undefined };
             requests.push(request);
-            if (request.method === 'GET' && !request.url.includes('/contents/')) return response(200, repositoryResult);
+            if (request.method === 'GET' && !request.url.includes('/contents/') && !request.url.includes('/git/blobs/')) return response(200, repositoryResult);
             return fetchHandler(request);
         },
         __save(record) { saved.push(clone(record)); },
         __notice(message) { notices.push(message); },
     });
     const source = scriptWithModuleMocks(fs.readFileSync(sourcePath, 'utf8').replace(/bootstrap\(\)\.catch\([\s\S]*?\);\s*$/, ''));
-    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaults, mergeVaultChanges, collectVaultConflicts, resolveSyncConflicts, keyMetadata, encryptText, decryptText: (value, key) => decryptText(JSON.parse(JSON.stringify(value)), key), persistVault, synchronize, pushRemote, pullRemote, lockVault, defaultVault, remoteRequest };`, context, { filename: sourcePath });
+    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaultChanges, resolveSyncConflicts, keyMetadata, encryptText, decryptText: (value, key) => decryptText(JSON.parse(JSON.stringify(value)), key), persistVault, synchronize, pushRemote, pullRemote, lockVault, remoteRequest, convertLegacyBackup, validateVault, ...__testModules['./sync-core.js'], defaultVault: __testModules['./vault-core.js'].defaultVault };`, context, { filename: sourcePath });
     return { api: context.testApi, context, saved, notices, confirmations, requests, timers };
 }
 
@@ -132,6 +132,48 @@ async function pushedVault(app, request) {
     const payload = JSON.parse(atob(request.body.content));
     return JSON.parse(await app.api.decryptText(payload.encryptedVault, app.api.state.vaultKey));
 }
+
+test('a remote file beyond the contents API size limit is read through the blobs endpoint', async () => {
+    let remote;
+    let blobRequest;
+    const app = loadApp(async (request) => {
+        if (request.url.includes('/git/blobs/')) {
+            blobRequest = request;
+            return response(200, { content: remote.content, encoding: 'base64', size: 2 * 1024 * 1024, sha: remote.sha });
+        }
+        if (request.method === 'GET') return response(200, { sha: remote.sha, size: 2 * 1024 * 1024, content: '', encoding: 'none' });
+        return response(200, { content: { sha: 'sha-accepted' } });
+    });
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base, { dirty: false });
+    remote = await remoteFile(app, vault({ entries: [entry('a'), entry('remote')] }));
+    await app.api.synchronize({ automatic: true });
+    assert.ok(blobRequest, 'the blob endpoint must supply content omitted by the contents endpoint');
+    assert.ok(blobRequest.url.endsWith(`/git/blobs/${remote.sha}`));
+    assert.deepEqual(clone(app.api.state.vault.entries.map((item) => item.id).sort()), ['a', 'remote']);
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+});
+
+test('legacy migration does not recreate an ID that is still in the trash', () => {
+    const app = loadApp();
+    const current = vault({ entries: [entry('kept')], trash: [entry('deleted', { deletedAt: timestamp })] });
+    const converted = app.api.convertLegacyBackup({ entries: [
+        { id: 'deleted', siteName: 'Deleted entry', account: 'synthetic@example.invalid', password: 'synthetic-password' },
+        { id: 'new', siteName: 'New entry', account: 'synthetic@example.invalid', password: 'synthetic-password' },
+    ] }, current);
+    assert.deepEqual(clone(converted.entries.map((item) => item.id).sort()), ['kept', 'new']);
+    assert.equal(converted.skipped, 1);
+    assert.doesNotThrow(() => app.api.validateVault({ ...current, entries: converted.entries, categories: converted.categories }));
+});
+
+test('persisting a duplicate ID is refused before it can lock the vault out', async () => {
+    const app = loadApp();
+    await initialize(app, vault({ entries: [entry('a')] }));
+    app.api.state.vault.trash.push(entry('a', { deletedAt: timestamp }));
+    await assert.rejects(app.api.persistVault(), /重复条目标识/);
+    assert.equal(app.saved.length, 0, 'an invalid vault must never reach encrypted storage');
+    assert.equal(app.api.state.localSaveError?.code, 'format');
+});
 
 test('three-way merge preserves independent edits, new entries, and permanent deletions', () => {
     const app = loadApp();
