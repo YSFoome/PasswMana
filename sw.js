@@ -1,22 +1,22 @@
 // Generated asset hashes are refreshed by node scripts/generate-sw.cjs.
 // BEGIN GENERATED SHELL
-const SHELL_VERSION = 'aaa3dcf639e63314894e518faf1e873a6c07106fd86bd9fd1783c8f15b9ee3c7';
+const SHELL_VERSION = '962823d3cd7707d85bbfdb8a2c0ae7f9dca8028ebacf63511122466d47fc953b';
 const APP_SHELL = [
     {
         "path": "./index.html",
-        "sha256": "67441c17ceea644797792c12c8a99694625989f655f1cb581803f9d2468298c7"
+        "sha256": "66ffa6d4890b83b6902eab1cd007d68d19bde1e53237aa761cd67de74a4ae284"
     },
     {
         "path": "./styles.css",
-        "sha256": "caf8d1b87b41953e070180dcdb365fe721382e46435c8d92b4df296dd17028e7"
+        "sha256": "6d19c021c26e92cb704fbc9cd8fb9cb54f405d9e4ffd8d63be58d191a3e84fb0"
     },
     {
         "path": "./app.js",
-        "sha256": "18112f3973a0ea1468fb9f32efe3b400d8ac27c09e7777cb62c1db998d6afc69"
+        "sha256": "d71d143cff19e293bbdaf5f820ce9e8c05982d011112b77dee353d0b174a2da2"
     },
     {
         "path": "./vault-core.js",
-        "sha256": "eebac5b8ce71bb0ae0e259bf321bc417cb37d028aac5f2d21f83dbe9b10d5031"
+        "sha256": "1fdc3f6c3c604939f8cd23a7fb88c7a3518680519cbe42b1d14c5f6d280abf06"
     },
     {
         "path": "./sync-core.js",
@@ -24,15 +24,15 @@ const APP_SHELL = [
     },
     {
         "path": "./ui-helpers.js",
-        "sha256": "fe88b393504ba259d587e2863cbc15bdcb959ecce733f79c2e6c82781629903b"
+        "sha256": "6ef78cb302aaf98d697721e2a6da9c3c7fe48758211111933094386890072295"
     },
     {
         "path": "./manifest.webmanifest",
-        "sha256": "427f193b4430513bd454879b3135ed8aca572b4adcf43176955ae9e83c5383e9"
+        "sha256": "2b91246ad2f2eec46811ddc150b620f6c09153d03b2c4cfcd1a64dc243fedeb5"
     },
     {
         "path": "./icon.svg",
-        "sha256": "b48cbf8c84b91f475e611db59edac8a3eff0c00d6f4b765060928e1e024c25f7"
+        "sha256": "ac57f5d5ed3e598fc87c7d2ba38eba1e88fd6f4651ce9be7c8759fc2742e37f6"
     },
     {
         "path": "./vendor/lucide-0.468.0.min.js",

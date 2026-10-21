@@ -38,17 +38,22 @@ export function createClipboardManager(clipboard, schedule = setTimeout, cancel 
     let timer;
     let generation = 0;
     return {
-        async copy(value) {
+        async copy(value, { clearAfter = 30000 } = {}) {
             await clipboard.writeText(value);
             const current = ++generation;
             cancel(timer);
+            timer = undefined;
+            // A copy made after a password replaces the clipboard contents, so
+            // the previous password timer must be cancelled even when the new
+            // value is not scheduled for clearing.
+            if (!(clearAfter > 0)) return;
             timer = schedule(async () => {
                 if (generation !== current || typeof clipboard.readText !== 'function') return;
                 try {
                     const contents = await clipboard.readText();
                     if (generation === current && contents === value) await clipboard.writeText('');
                 } catch { /* Do not erase unrelated clipboard data when read access is unavailable. */ }
-            }, 30000);
+            }, clearAfter);
         },
     };
 }

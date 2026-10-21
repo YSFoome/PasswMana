@@ -86,6 +86,30 @@ test('clipboard cleanup does not erase content when read access is denied or una
     }
 });
 
+test('a copy that opts out of cleanup cancels the previous password timer', async () => {
+    const { createClipboardManager } = await helpersPromise;
+    const clock = fakeClock();
+    let contents = '';
+    const manager = createClipboardManager({ async writeText(value) { contents = value; }, async readText() { return contents; } }, clock.schedule, clock.cancel);
+    await manager.copy('synthetic-password');
+    await clock.advance(10000);
+    await manager.copy('synthetic-account-name', { clearAfter: 0 });
+    await clock.advance(60000);
+    assert.equal(contents, 'synthetic-account-name', 'a non-secret copy must not inherit the password cleanup timer');
+});
+
+test('a copy can use a longer cleanup window', async () => {
+    const { createClipboardManager } = await helpersPromise;
+    const clock = fakeClock();
+    let contents = '';
+    const manager = createClipboardManager({ async writeText(value) { contents = value; }, async readText() { return contents; } }, clock.schedule, clock.cancel);
+    await manager.copy('synthetic-recovery-code', { clearAfter: 120000 });
+    await clock.advance(119999);
+    assert.equal(contents, 'synthetic-recovery-code');
+    await clock.advance(1);
+    assert.equal(contents, '');
+});
+
 test('an old asynchronous clipboard read cannot clear a newer copy', async () => {
     const { createClipboardManager } = await helpersPromise;
     const callbacks = [];
