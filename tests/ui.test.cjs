@@ -127,6 +127,19 @@ test('an old asynchronous clipboard read cannot clear a newer copy', async () =>
     assert.equal(contents, 'synthetic-password-B');
 });
 
+test('sortEntries pins favorites in the default order and sorts by title or creation date', async () => {
+    const { sortEntries } = await helpersPromise;
+    const entries = [
+        { id: 'a', title: 'Alpha', favorite: true, updatedAt: '2026-01-01T00:00:00Z', createdAt: '2026-01-01T00:00:00Z' },
+        { id: 'b', title: 'Bravo', favorite: false, updatedAt: '2026-01-02T00:00:00Z', createdAt: '2026-01-02T00:00:00Z' },
+        { id: 'c', title: 'Charlie', favorite: false, updatedAt: '2026-01-03T00:00:00Z', createdAt: '2026-01-03T00:00:00Z' },
+    ];
+    assert.deepEqual(sortEntries(entries, 'updated').map((entry) => entry.id), ['a', 'c', 'b']);
+    assert.deepEqual(sortEntries(entries, 'title').map((entry) => entry.id), ['a', 'b', 'c']);
+    assert.deepEqual(sortEntries(entries, 'created').map((entry) => entry.id), ['c', 'b', 'a']);
+    assert.deepEqual(entries.map((entry) => entry.id), ['a', 'b', 'c'], 'sorting must not mutate the vault array');
+});
+
 test('password generation uses rejection sampling rather than modulo-biased bytes', async () => {
     const { generatePassword } = await helpersPromise;
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*-_+';

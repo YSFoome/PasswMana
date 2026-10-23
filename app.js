@@ -14,8 +14,9 @@ const SYNC_TIMEOUT_MS = 20000;
 const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
 const REVEAL_TIMEOUT_MS = 30000;
 const CLIPBOARD_CLEAR_MS = 30000;
+const SORT_LABELS = Object.freeze({ updated: '最近更新', title: '名称 A–Z', created: '添加日期' });
 
-import { passwordStrength, generatePassword, safeWebUrl, parseGithubRepository, createClipboardManager, formValues, showFormError, enhanceDialogs, trapDialogKey } from './ui-helpers.js';
+import { passwordStrength, generatePassword, safeWebUrl, parseGithubRepository, createClipboardManager, formValues, showFormError, enhanceDialogs, trapDialogKey, sortEntries } from './ui-helpers.js';
 
 const app = document.getElementById('app');
 const state = {
@@ -29,6 +30,7 @@ const state = {
   search: '',
   category: '',
   favoriteOnly: false,
+  sort: 'updated',
   modal: null,
   syncing: null,
   syncLastError: null,
@@ -41,6 +43,7 @@ const state = {
   syncPollTimer: null,
   syncRetryCount: 0,
   syncRetryAt: 0,
+  syncForegroundAt: 0,
   syncBlocked: false,
   drawerOpen: false,
   timer: null,
@@ -146,12 +149,14 @@ async function acquireVaultLock() {
     let report;
     const acquired = new Promise((resolve) => { report = resolve; });
     navigator.locks.request('passwmana-unlocked', { ifAvailable: true }, async (lock) => {
-        if (!lock) { report(false); return; }
+        if (!lock) { report('busy'); return; }
         const released = new Promise((resolve) => { state.releaseVaultLock = resolve; });
-        report(true);
+        report('held');
         await released;
-    }).catch(() => report(false));
-    if (!await acquired) throw new Error('保险库已在另一个标签页解锁，请先锁定该页面');
+    }).catch(() => report('busy'));
+    const outcome = await acquired;
+    if (outcome === 'held') return;
+    throw new Error('保险库已在另一个标签页解锁，请先锁定该页面');
 }
 
 function releaseVaultLock() {
@@ -166,6 +171,8 @@ function lockVault() {
   clearTimeout(state.lockWarningTimer);
   clearTimeout(state.draftTimer);
   clearTimeout(state.revealTimer);
+  clearTimeout(vaultListTimer);
+  vaultListTimer = null;
   state.revealTimer = null;
   captureEntryDraft();
   if (state.formDraft && state.vaultKey) void persistEntryDraft().catch(() => {});
@@ -174,6 +181,8 @@ function lockVault() {
   state.vaultKey = null;
   state.rawVaultKey = null;
   state.vault = null;
+  const modalResolve = state.modal?.resolve;
+  if (modalResolve) modalResolve(state.modal.type === 'prompt' ? null : false);
   state.modal = null;
   state.pendingRemote = null;
   state.drawerOpen = false;
@@ -185,11 +194,25 @@ function lockVault() {
 
 function currentEntries() {
   const query = state.search.trim().toLocaleLowerCase();
-  return state.vault.entries
+  const matches = state.vault.entries
     .filter((entry) => !state.category || entry.category === state.category)
     .filter((entry) => !state.favoriteOnly || entry.favorite)
-    .filter((entry) => !query || [entry.title, entry.username, entry.category, entry.url, entry.notes].some((value) => String(value || '').toLocaleLowerCase().includes(query)))
-    .sort((a, b) => Number(b.favorite) - Number(a.favorite) || new Date(b.updatedAt) - new Date(a.updatedAt));
+    .filter((entry) => !query || searchableEntryText(entry).includes(query));
+  return sortEntries(matches, state.sort);
+}
+
+// Lowercasing every searchable field on each keystroke is the expensive part of
+// filtering a large vault. Entries are replaced on edit, so a WeakMap cache is
+// invalidated naturally without re-indexing the whole vault.
+const entrySearchIndex = new WeakMap();
+function searchableEntryText(entry) {
+  let text = entrySearchIndex.get(entry);
+  if (text === undefined) {
+    text = [entry.title, entry.username, entry.category, entry.url, entry.notes]
+      .map((value) => String(value || '').toLocaleLowerCase()).join('\n');
+    entrySearchIndex.set(entry, text);
+  }
+  return text;
 }
 
 function timeLabel(iso) {
@@ -209,13 +232,20 @@ function hostOf(entry) {
     } catch { return ''; }
 }
 
-// A stable identity tab per site, derived from the host so every device agrees
-// without storing anything. Entries without a URL fall back to their title.
-function identityTab(entry) {
-    const key = hostOf(entry) || entry.title || '';
+// A stable colour tone per site/category so equal subjects share a tone without
+// storing anything. Entries without a URL fall back to their title.
+function toneIndex(key) {
     let hash = 0;
     for (let index = 0; index < key.length; index += 1) hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
     return hash % 8;
+}
+
+function identityTab(entry) {
+    return toneIndex(hostOf(entry) || entry.title || '');
+}
+
+function categoryTone(category) {
+    return String(toneIndex(category));
 }
 
 function validTimestamp(value, fallback) {
@@ -303,14 +333,14 @@ function entryTemplate(entry) {
         host ? `<span class="entry-host">${escapeHtml(host)}</span>` : '',
         `<span class="entry-time">${timeLabel(entry.updatedAt)}</span>`,
     ].join('');
-    const tools = `<div class="entry-tools"><button class="row-tool" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制 ${escapeHtml(entry.title)} 的密码">${icon('copy')}</button>${url ? `<a class="row-tool" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="打开网站" aria-label="打开 ${escapeHtml(entry.title)} 的网站">${icon('external-link')}</a>` : ''}</div>`;
-    return `<div class="entry-row" data-tab="${identityTab(entry)}"><button class="entry" data-action="open-detail" data-id="${id}"><span class="entry-name"><span>${escapeHtml(entry.title)}</span>${entry.favorite ? icon('star', 'starred') : ''}</span><span class="entry-meta">${meta}</span></button>${tools}</div>`;
+    const tools = `<div class="entry-tools"><button class="row-tool favorite-tool ${entry.favorite ? 'is-favorite' : ''}" data-action="toggle-favorite" data-id="${id}" title="${escapeHtml(`${entry.favorite ? '取消收藏' : '收藏'} ${entry.title}`)}" aria-label="${escapeHtml(`${entry.favorite ? '取消收藏' : '收藏'} ${entry.title}`)}" aria-pressed="${Boolean(entry.favorite)}">${icon('star', entry.favorite ? 'starred' : '')}</button><button class="row-tool" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制 ${escapeHtml(entry.title)} 的密码">${icon('copy')}</button>${url ? `<a class="row-tool" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="打开网站" aria-label="打开 ${escapeHtml(entry.title)} 的网站">${icon('external-link')}</a>` : ''}</div>`;
+    return `<div class="entry-row" data-tab="${identityTab(entry)}"><button class="entry" data-action="open-detail" data-id="${id}"><span class="entry-name"><span>${escapeHtml(entry.title)}</span></span><span class="entry-meta">${meta}</span></button>${tools}</div>`;
 }
 
 function vaultListTemplate() {
     const entries = currentEntries();
-    if (!state.vault.entries.length) return `<div class="empty-state">${icon('vault')}<h2>还没有密码条目</h2><p>添加第一条密码，或导入已有保险库。</p><div class="empty-actions"><button class="primary-button" data-action="open-add">${icon('plus')}添加第一条密码</button><button class="secondary-button" data-action="import-backup">${icon('upload')}从备份导入</button></div></div>`;
-    if (!entries.length) return `<div class="empty-state">${icon('search')}<h2>没有匹配的密码条目</h2><p>尝试其他关键词，或清除分类与收藏筛选。</p><button class="secondary-button" data-action="clear-filters">清除筛选</button></div>`;
+    if (!state.vault.entries.length) return `<div class="empty-state">${icon('vault')}<h2>这里还空着</h2><p>记下第一个账号，它只会加密保存在这台设备。</p><div class="empty-actions"><button class="primary-button" data-action="open-add">${icon('plus')}添加第一条密码</button><button class="secondary-button" data-action="import-backup">${icon('upload')}从备份导入</button></div></div>`;
+    if (!entries.length) return `<div class="empty-state">${icon('search')}<h2>没有找到匹配的条目</h2><p>换个关键词，或者清除当前的筛选。</p><button class="secondary-button" data-action="clear-filters">清除筛选</button></div>`;
     // Group by the categories the person maintains, in their own order: the
     // list should mirror how they think about their accounts, not a flat table.
     const buckets = new Map();
@@ -322,20 +352,59 @@ function vaultListTemplate() {
     }
     return [...state.vault.categories, '未分类']
         .filter((label) => buckets.has(label))
-        .map((label) => `<div class="group-heading"><strong>${escapeHtml(label)}</strong><span>${buckets.get(label).length}</span></div>${buckets.get(label).map(entryTemplate).join('')}`)
+        .map((label) => `<div class="group-heading">${label === '未分类' ? '<i class="category-dot all"></i>' : `<i class="category-dot" data-tab="${categoryTone(label)}"></i>`}<strong>${escapeHtml(label)}</strong><span>${buckets.get(label).length}</span></div>${buckets.get(label).map(entryTemplate).join('')}`)
         .join('');
 }
 
+let vaultListTimer = null;
+
 function updateVaultList() {
+  clearTimeout(vaultListTimer);
+  vaultListTimer = null;
   normalizeCategoryFilter();
   const list = app.querySelector('[data-vault-list]');
   if (!list) return;
   list.innerHTML = vaultListTemplate();
-  drawIcons();
+  drawIcons(list);
+}
+
+function scheduleVaultListUpdate() {
+  clearTimeout(vaultListTimer);
+  vaultListTimer = setTimeout(() => {
+    vaultListTimer = null;
+    updateVaultList();
+  }, 120);
 }
 
 function normalizeCategoryFilter() {
   if (state.vault && state.category && !state.vault.categories.includes(state.category)) state.category = '';
+}
+
+function syncFavoriteControls(entry) {
+    const favorite = Boolean(entry.favorite);
+    const label = `${favorite ? '取消收藏' : '收藏'} ${entry.title}`;
+    const nodes = [...app.querySelectorAll('[data-action="toggle-favorite"]')].filter((node) => node.dataset.id === entry.id);
+    for (const node of nodes) {
+        node.classList.toggle('is-favorite', favorite);
+        node.setAttribute('aria-pressed', String(favorite));
+        node.title = label;
+        node.setAttribute('aria-label', label);
+        const mark = node.querySelector('svg');
+        if (mark) mark.classList.toggle('starred', favorite);
+        const stateLabel = node.querySelector('[data-favorite-state]');
+        if (stateLabel) stateLabel.textContent = favorite ? '已收藏' : '收藏';
+    }
+    drawIcons();
+}
+
+function animateFavorite(entryId) {
+    for (const node of app.querySelectorAll('[data-action="toggle-favorite"]')) {
+        if (node.dataset.id !== entryId) continue;
+        const star = node.querySelector('svg');
+        if (!star) continue;
+        star.classList.add('just-favorited');
+        setTimeout(() => star.classList.remove('just-favorited'), 360);
+    }
 }
 
 function syncStatus() {
@@ -346,7 +415,7 @@ function syncStatus() {
     if (navigator.onLine === false) return { label: '离线保存', detail: '改动已在本地加密保存，联网并解锁后自动同步', status: 'pending', icon: 'cloud-off' };
     if (state.syncLastError) return { label: state.syncBlocked ? '需要处理同步' : '等待重试', detail: state.syncLastError.message, status: 'error', icon: 'circle-alert' };
     if (state.record.dirty) return { label: '等待同步', detail: state.vault.sync.automatic === false ? '改动已在本地保存，请手动同步' : '改动已在本地保存，即将自动同步', status: 'pending', icon: 'cloud-upload' };
-    return { label: '已同步', detail: state.record.lastSyncedAt ? `最近同步：${new Date(state.record.lastSyncedAt).toLocaleString('zh-CN')}` : '本地保险库已与私有仓库同步', status: 'synced', icon: 'cloud-check' };
+    return { label: '已同步', detail: state.record.lastSyncedAt ? `最近同步：${new Date(state.record.lastSyncedAt).toLocaleString('zh-CN')}` : '本地保险库已与私有仓库同步', status: 'synced', icon: 'cloud-upload' };
 }
 
 function refreshSyncStatus() {
@@ -355,9 +424,20 @@ function refreshSyncStatus() {
     app.querySelectorAll('[data-sync-label]').forEach((node) => { node.textContent = status.label; });
     app.querySelectorAll('[data-sync-detail]').forEach((node) => { node.textContent = status.detail; });
     app.querySelectorAll('[data-sync-status]').forEach((node) => { node.dataset.syncStatus = status.status; node.title = status.detail; });
-    app.querySelectorAll('[data-sync-icon]').forEach((node) => { node.innerHTML = icon(status.icon, state.syncing ? 'is-spinning' : ''); });
+    const spinning = state.syncing ? 'is-spinning' : '';
+    const syncNodes = [...app.querySelectorAll('[data-sync-icon]')];
+    for (const node of syncNodes) {
+        // Keep the drawing stable while the same icon shows; only the spinner
+        // has to change between poll and sync.
+        const mark = node.querySelector('svg');
+        if (mark?.dataset.lucide === status.icon) {
+            mark.classList.toggle('is-spinning', Boolean(spinning));
+            continue;
+        }
+        node.innerHTML = icon(status.icon, spinning);
+    }
     app.querySelectorAll('[data-action="pull-remote"], [data-action="push-remote"]').forEach((node) => { node.disabled = Boolean(state.syncing); });
-    drawIcons();
+    drawIcons(syncNodes);
 }
 
 function refreshVaultViews() {
@@ -369,12 +449,8 @@ function refreshVaultViews() {
             if (secret) secret.textContent = state.modal.revealed ? entry.password : '••••••••••••••••';
             const title = app.querySelector('.modal-head h2');
             if (title) title.textContent = entry.title;
+            syncFavoriteControls(entry);
         } else { clearTimeout(state.revealTimer); state.revealTimer = null; state.modal = null; render(); toast('此条目已在其他设备删除'); }
-    }
-    const filter = app.querySelector('[data-input="category"]');
-    if (filter && filter !== document.activeElement) {
-        filter.innerHTML = `<option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('')}`;
-        filter.value = state.category;
     }
     // Background updates must leave open forms, their values and focus intact.
     for (const [panel, template] of Object.entries({ sync: renderSyncSettings, security: renderSecuritySettings, categories: renderCategoriesSettings, trash: renderTrashSettings })) {
@@ -393,7 +469,7 @@ function renderVault() {
   // itself in one quiet line in the sidebar.
   const actionable = status.status === 'error' || (syncConfigured() && !state.record.remoteSha);
   const notice = actionable ? `<div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}同步详情</button></div>` : '';
-  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault">${notice}<div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索名称、账户、网址或备注" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
+  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault">${notice}<div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索名称、账户、网址或备注" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><button class="secondary-button filter-menu" data-action="open-category-filter" title="选择分类" aria-label="选择分类">${icon('tags')}</button><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><select class="field sort-filter" data-input="sort" aria-label="排序方式">${Object.entries(SORT_LABELS).map(([value, label]) => `<option value="${value}" ${state.sort === value ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
 }
 
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: '外观', categories: '分类', trash: '回收站' };
@@ -478,12 +554,12 @@ function renderAppearanceSettings() {
 }
 
 function renderCategoriesSettings() {
-  return `<section class="settings-panel ${state.settingPanel === 'categories' ? 'active' : ''}" data-panel="categories"><h2>分类</h2><p class="panel-intro">分类用于整理和筛选密码条目，可以按自己的习惯维护。</p><div class="category-list">${state.vault.categories.map((category) => `<div class="category-row"><span><i class="category-dot"></i>${escapeHtml(category)}</span><button class="icon-button" data-action="delete-category" data-category="${escapeHtml(category)}" title="删除分类" aria-label="删除 ${escapeHtml(category)}">${icon('trash-2')}</button></div>`).join('')}</div><button class="secondary-button" data-action="add-category">${icon('plus')}新增分类</button></section>`;
+  return `<section class="settings-panel ${state.settingPanel === 'categories' ? 'active' : ''}" data-panel="categories"><h2>分类</h2><p class="panel-intro">分类用于整理和筛选密码条目，可以按自己的习惯维护。</p><div class="category-list">${state.vault.categories.map((category) => `<div class="category-row"><span><i class="category-dot" data-tab="${categoryTone(category)}"></i>${escapeHtml(category)}</span><button class="icon-button" data-action="delete-category" data-category="${escapeHtml(category)}" title="删除分类" aria-label="删除 ${escapeHtml(category)}">${icon('trash-2')}</button></div>`).join('')}</div><button class="secondary-button" data-action="add-category">${icon('plus')}新增分类</button></section>`;
 }
 
 function renderTrashSettings() {
-  const entries = state.vault.trash.sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
-  return `<section class="settings-panel ${state.settingPanel === 'trash' ? 'active' : ''}" data-panel="trash"><h2>回收站</h2><p class="panel-intro">删除的条目保留 30 天，之后会自动永久清除。</p><div class="setting-list">${entries.length ? entries.map((entry) => `<div class="setting-row"><div class="setting-copy"><strong>${escapeHtml(entry.title)}</strong><span>删除于 ${timeLabel(entry.deletedAt)}</span></div><div><button class="secondary-button" data-action="restore-entry" data-id="${escapeHtml(entry.id)}">恢复</button><button class="icon-button" data-action="purge-entry" data-id="${escapeHtml(entry.id)}" title="永久删除" aria-label="永久删除 ${escapeHtml(entry.title)}">${icon('trash-2')}</button></div></div>`).join('') : `<div class="empty-state">${icon('trash-2')}<div>回收站为空</div></div>`}</div></section>`;
+  const entries = [...state.vault.trash].sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
+  return `<section class="settings-panel ${state.settingPanel === 'trash' ? 'active' : ''}" data-panel="trash"><h2>回收站</h2><p class="panel-intro">删除的条目保留 30 天，之后会自动永久清除。</p><div class="setting-list">${entries.length ? entries.map((entry) => `<div class="setting-row"><div class="setting-copy"><strong>${escapeHtml(entry.title)}</strong><span>删除于 ${timeLabel(entry.deletedAt)}</span></div><div><button class="secondary-button" data-action="restore-entry" data-id="${escapeHtml(entry.id)}">恢复</button><button class="icon-button" data-action="purge-entry" data-id="${escapeHtml(entry.id)}" title="永久删除" aria-label="永久删除 ${escapeHtml(entry.title)}">${icon('trash-2')}</button></div></div>`).join('') : `<div class="empty-state">${icon('trash-2')}<div>回收站是空的</div></div>`}</div></section>`;
 }
 
 function renderSettings() {
@@ -493,12 +569,26 @@ function renderSettings() {
 function modalTemplate() {
     const modal = state.modal;
     if (!modal) return '';
-    const close = `<button class="icon-button" type="button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button>`;
+    const close = `<button class="icon-button" type="button" data-action="close-modal" title="关闭" aria-label="关闭" ${modal.type === 'confirm' || modal.type === 'prompt' ? 'hidden' : ''}>${icon('x')}</button>`;
     const shell = (title, body, foot = '', form = '') => `<div class="modal-layer open ${form ? 'form-open' : ''}" data-modal-layer><${form ? 'form' : 'section'} class="modal" ${form ? `data-form="${form}"` : ''}><header class="modal-head"><h2>${escapeHtml(title)}</h2>${close}</header><div class="modal-body">${body}</div>${foot ? `<footer class="modal-foot">${foot}</footer>` : ''}</${form ? 'form' : 'section'}></div>`;
     const cancel = `<button class="secondary-button" type="button" data-action="close-modal">取消</button>`;
+    if (modal.type === 'confirm') {
+        const body = `${modal.message ? `<p>${escapeHtml(modal.message)}</p>` : ''}`;
+        const confirm = `<button class="${modal.danger ? 'danger-button' : 'primary-button'}" type="submit">${escapeHtml(modal.confirmLabel || '继续')}</button>`;
+        return shell(modal.title, body, `<button class="secondary-button" type="button" data-action="close-modal" data-autofocus>${escapeHtml(modal.cancelLabel || '取消')}</button>${confirm}`, 'confirm');
+    }
+    if (modal.type === 'prompt') {
+        return shell(modal.title, `${modal.message ? `<p>${escapeHtml(modal.message)}</p>` : ''}<label class="form-field">${escapeHtml(modal.label || '名称')}<input class="field" name="value" value="${escapeHtml(modal.value || '')}" placeholder="${escapeHtml(modal.placeholder || '')}" autocomplete="off" required /></label>`, `<button class="secondary-button" type="button" data-action="close-modal">取消</button><button class="primary-button" type="submit">${escapeHtml(modal.confirmLabel || '保存')}</button>`, 'prompt');
+    }
+    if (modal.type === 'message') {
+        return shell(modal.title, `<div class="message-body" role="status">${escapeHtml(modal.message)}</div>`, `<button class="primary-button" type="button" data-action="close-modal" data-autofocus>${escapeHtml(modal.confirmLabel || '知道了')}</button>`);
+    }
     if (modal.type === 'category-filter') {
-        const options = [['', '全部分类'], ...state.vault.categories.map((category) => [category, category])];
-        return shell('筛选密码', `<button class="secondary-button" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}">${icon('star')}<span data-favorite-label>${state.favoriteOnly ? '显示全部条目' : '仅看收藏'}</span></button><div class="category-list">${options.map(([value, label]) => `<button class="category-row" data-action="select-category" data-category="${escapeHtml(value)}"><span><i class="category-dot"></i>${escapeHtml(label)}</span>${state.category === value ? icon('check') : ''}</button>`).join('')}</div>`);
+        const counts = new Map();
+        for (const entry of state.vault.entries) counts.set(entry.category, (counts.get(entry.category) || 0) + 1);
+        const options = [['', '全部分类', state.vault.entries.length], ...state.vault.categories.map((category) => [category, category, counts.get(category) || 0])];
+        const dot = (value) => value ? `<i class="category-dot" data-tab="${categoryTone(value)}"></i>` : '<i class="category-dot all"></i>';
+        return shell('选择分类', `<div class="category-list">${options.map(([value, label, count]) => `<button class="category-row ${state.category === value ? 'active' : ''}" data-action="select-category" data-category="${escapeHtml(value)}" aria-pressed="${state.category === value}"><span>${dot(value)}${escapeHtml(label)}</span><span class="category-meta">${count}${state.category === value ? icon('check') : ''}</span></button>`).join('')}</div>`);
     }
     if (modal.type === 'add' || modal.type === 'edit') {
         const entry = { title: '', username: '', password: '', category: state.vault.categories[0] || '', url: '', notes: '', favorite: false, ...(modal.entry || {}), ...(modal.draft?.values || {}) };
@@ -515,7 +605,10 @@ function modalTemplate() {
         // app's one dark surface so nothing competes with reading it.
         const plate = `<div class="plate secret"><span class="secret-value plate-value" data-secret-value>${modal.revealed ? escapeHtml(entry.password) : '••••••••••••••••'}</span><button class="icon-button" data-action="reveal-password" aria-label="${modal.revealed ? '隐藏密码' : '显示密码'}" aria-pressed="${Boolean(modal.revealed)}">${icon(modal.revealed ? 'eye-off' : 'eye')}</button><button class="primary-button" data-action="copy-password" data-id="${id}">${icon('copy')}复制</button></div>`;
         const rows = `<div class="detail-row"><dt>账户</dt><dd class="detail-inline"><span>${escapeHtml(entry.username || '未设置')}</span><button class="icon-button" data-action="copy-account" data-id="${id}" title="复制账户" aria-label="复制账户">${icon('copy')}</button></dd></div><div class="detail-row"><dt>网址</dt><dd>${url ? `<a class="detail-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><span class="detail-host">${escapeHtml(host)}</span>${icon('external-link')}</a>` : escapeHtml(entry.url || '未设置')}</dd></div><div class="detail-row"><dt>分类</dt><dd>${escapeHtml(entry.category || '未分类')}</dd></div><div class="detail-row"><dt>更新时间</dt><dd class="detail-when">${new Date(entry.updatedAt).toLocaleString('zh-CN')}</dd></div>${entry.notes ? `<div class="detail-row"><dt>备注</dt><dd class="detail-note">${escapeHtml(entry.notes)}</dd></div>` : ''}`;
-        return shell(entry.title, `${plate}<dl>${rows}</dl>`, `<button class="danger-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}删除</button><button class="secondary-button" data-action="open-edit" data-id="${id}">${icon('pencil')}编辑</button>`);
+        const favorite = `<button class="secondary-button favorite-button ${entry.favorite ? 'is-favorite' : ''}" data-action="toggle-favorite" data-id="${id}" aria-pressed="${Boolean(entry.favorite)}" title="${entry.favorite ? '取消收藏' : '收藏此条目'}" aria-label="${entry.favorite ? '取消收藏' : '收藏此条目'}">${icon('star', entry.favorite ? 'starred' : '')}<span data-favorite-state>${entry.favorite ? '已收藏' : '收藏'}</span></button>`;
+        const remove = `<button class="danger-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}删除</button>`;
+        const edit = `<button class="secondary-button" data-action="open-edit" data-id="${id}">${icon('pencil')}编辑</button>`;
+        return shell(entry.title, `${plate}<dl>${rows}</dl>`, `${remove}${favorite}${edit}`);
     }
     if (modal.type === 'sync') {
         const first = !state.record.remoteSha;
@@ -551,15 +644,56 @@ function renderApp() {
   const title = state.view === 'vault' ? '密码库' : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
   const status = syncStatus();
   const minutes = state.vault.preferences.lockMinutes;
+  const now = new Date();
+  const dateLine = `${now.getMonth() + 1} 月 ${now.getDate()} 日 · ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()]}`;
   const nav = `<nav class="main-nav"><button class="nav-link ${state.view === 'vault' ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}密码库</button><button class="nav-link ${state.view === 'settings' ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}设置</button></nav>`;
-  const identity = `<div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><div class="brand-note">本机保险库</div>`;
+  const identity = `<div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><div class="brand-note">你的本机保险库</div><div class="brand-date">${dateLine}</div>`;
   const footer = `<div class="nav-footer"><button class="nav-status" data-action="open-sync" data-sync-status="${status.status}"><span data-sync-icon>${icon(status.icon, state.syncing ? 'is-spinning' : '')}</span><span data-sync-label>${escapeHtml(status.label)}</span></button><span class="nav-countdown">${minutes ? `闲置 ${minutes} 分钟后锁定` : '自动锁定已关闭'}</span></div>`;
   app.innerHTML = `<div class="app-shell"><aside class="side-nav">${identity}${nav}${footer}</aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="${state.settingsDetail ? '返回设置' : '打开导航'}" aria-label="${state.settingsDetail ? '返回设置' : '打开导航'}">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><div class="mobile-header-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></div></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync" data-sync-status="${status.status}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(status.label)}</span>${icon('refresh-cw')}</button></div></header><div class="page">${state.savedDraft ? '<div class="notice draft-notice"><span>有一份未完成的密码编辑</span><div class="empty-actions"><button class="secondary-button" data-action="resume-draft">继续编辑</button><button class="secondary-button" data-action="discard-draft">放弃草稿</button></div></div>' : ''}${state.updateReady ? '<div class="notice"><span>新版本已准备好</span><button class="secondary-button" data-action="apply-update">保存草稿并更新</button></div>' : ''}${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}">${identity}${nav}${footer}</aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap" role="status" aria-live="polite" aria-atomic="true"></div>`;
   queueMicrotask(drawIcons);
 }
 
-function drawIcons() {
-  if (window.lucide) window.lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+const lucideIconNames = new Map();
+
+function lucideIconKey(slug) {
+  let key = lucideIconNames.get(slug);
+  if (!key) {
+    key = slug.split('-').filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+    lucideIconNames.set(slug, key);
+  }
+  return key;
+}
+
+function drawIcons(root = document) {
+  const lucide = window.lucide;
+  if (!lucide) return;
+  // A container works for a region; a list of icons needs its own lookup.
+  const placeholders = (node) => node.querySelectorAll ? node.querySelectorAll('[data-lucide]') : node;
+  // The vendored build exposes per-icon factories, so refreshing one region
+  // never rescans and rewrites every icon in the document.
+  if (!lucide.createElement || !lucide.icons) {
+    lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+    return;
+  }
+  for (const node of [...placeholders(root)]) {
+    if (node instanceof SVGSVGElement) continue;
+    const slug = node.getAttribute('data-lucide');
+    if (!slug) continue;
+    const definition = lucide.icons[lucideIconKey(slug)];
+    if (!definition) {
+      lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+      return;
+    }
+    const svg = lucide.createElement(definition);
+    svg.setAttribute('data-lucide', slug);
+    svg.setAttribute('stroke-width', '1.8');
+    svg.classList.add('lucide', `lucide-${slug}`);
+    for (const name of node.classList) {
+      if (name !== 'lucide' && !name.startsWith('lucide-')) svg.classList.add(name);
+    }
+    node.replaceWith(svg);
+  }
 }
 
 const darkScheme = window.matchMedia?.('(prefers-color-scheme: dark)');
@@ -699,7 +833,12 @@ async function importLegacyBackup() {
         throw new Error('这是新版加密备份，请使用“恢复加密备份”');
       }
       if (!Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
-      const confirmed = confirm('旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？');
+      const confirmed = await askConfirm({
+          title: '迁移旧版备份',
+          message: '旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？',
+          confirmLabel: '迁移并合并',
+          danger: true,
+      });
       if (!confirmed) return;
       const converted = convertLegacyBackup(data, state.vault);
       // Validate the merged shape before replacing memory or storage. A bad
@@ -709,7 +848,10 @@ async function importLegacyBackup() {
       state.vault.categories = converted.categories;
       await persistVault();
       render();
-      alert(`迁移完成：新增 ${converted.added} 项，更新 ${converted.updated} 项，跳过 ${converted.skipped} 项。\n\n旧版 JSON 仍含明文密码，请在确认数据无误后安全删除该文件。`);
+      showMessage({
+          title: '迁移完成',
+          message: `新增 ${converted.added} 项，更新 ${converted.updated} 项，跳过 ${converted.skipped} 项。\n\n旧版 JSON 仍含明文密码，请在确认数据无误后安全删除该文件。`,
+      });
     } catch (error) {
       toast(`迁移失败: ${error.message}`);
     }
@@ -743,6 +885,7 @@ function stopSyncSession() {
     state.syncBlocked = false;
     state.syncRetryCount = 0;
     state.syncRetryAt = 0;
+    state.syncForegroundAt = 0;
     state.verifiedSyncTarget = null;
     state.pendingRemote = null;
     state.syncConflict = null;
@@ -761,15 +904,32 @@ function scheduleAutoSync(delay = SYNC_DEBOUNCE_MS) {
         || !state.record.remoteSha || state.syncBlocked) return;
     clearTimeout(state.syncTimer);
     if (navigator.onLine === false || document.visibilityState === 'hidden') return;
-    const wait = Math.max(delay, state.syncRetryAt - Date.now(), 0);
-    state.syncTimer = setTimeout(() => { void synchronize({ automatic: true }); }, wait);
+    state.syncTimer = setTimeout(() => { void synchronize({ automatic: true }); }, pendingSyncDelay(delay));
+}
+
+// Foreground events arrive in bursts (focus + visibility, several tabs switching
+// back). Revalidation is cheap but still a request, so collapses them into one.
+const SYNC_FOREGROUND_PAUSE_MS = 10000;
+
+function pendingSyncDelay(delay) {
+    const pause = Date.now() < state.syncForegroundAt + SYNC_FOREGROUND_PAUSE_MS
+        ? state.syncForegroundAt + SYNC_FOREGROUND_PAUSE_MS - Date.now() : 0;
+    return Math.max(delay, state.syncRetryAt - Date.now(), Math.min(pause, SYNC_FOREGROUND_PAUSE_MS), 0);
+}
+
+function syncOnForeground() {
+    if (!state.vaultKey || !syncConfigured() || state.vault.sync.automatic === false || !state.record.remoteSha) return;
+    // An idle tab returning to view only needs to revalidate; edits still sync
+    // through the normal debounce.
+    state.syncForegroundAt = state.record.dirty ? 0 : Date.now();
+    scheduleAutoSync(0);
 }
 
 function assertSyncSession(session) {
     if (session !== state.session || !state.vaultKey) throw new DOMException('同步已取消', 'AbortError');
 }
 
-async function remoteRequest(method, sync, body, { repository = false, blob = '' } = {}) {
+async function remoteRequestWithMetadata(method, sync, body, { repository = false, blob = '', etag = '' } = {}) {
     const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
     const root = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}`;
     const url = blob ? `${root}/git/blobs/${encodeURIComponent(blob)}`
@@ -782,12 +942,22 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
     if (sessionSignal?.aborted) controller.abort();
     const timer = setTimeout(abort, SYNC_TIMEOUT_MS);
     try {
+        const conditional = method === 'GET' && etag && !repository && !blob;
         const response = await fetch(url, {
             method, cache: 'no-store', signal: controller.signal,
-            headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+            headers: {
+                ...githubHeaders(sync.token),
+                ...(conditional ? { 'If-None-Match': etag } : {}),
+                ...(body ? { 'Content-Type': 'application/json' } : {}),
+            },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (response.status === 404 && method === 'GET' && !repository && !blob) return null;
+        if (response.status === 404 && method === 'GET' && !repository && !blob) return { data: null, etag: '' };
+        // 304 carries no body and is not charged to the primary rate limit; the
+        // caller already holds the revision this ETag names.
+        if (conditional && response.status === 304) {
+            return { notModified: true, etag: response.headers.get('etag') || etag };
+        }
         const result = await response.json().catch(() => ({}));
         if (!response.ok) {
             const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
@@ -800,7 +970,7 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
             }
             throw error;
         }
-        return result;
+        return { data: result, etag: response.headers.get('etag') || '' };
     } catch (error) {
         if (controller.signal.aborted && !sessionSignal?.aborted) {
             const timeout = new Error('连接 GitHub 超时，将稍后重试');
@@ -812,6 +982,11 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
         clearTimeout(timer);
         sessionSignal?.removeEventListener('abort', abort);
     }
+}
+
+async function remoteRequest(method, sync, body, options = {}) {
+    const result = await remoteRequestWithMetadata(method, sync, body, options);
+    return result.data;
 }
 
 function isRetryableSyncError(error) {
@@ -860,8 +1035,15 @@ function decodeRemote(remote) {
 
 function remoteRecord(record) {
     // Device sync bookkeeping and the encrypted merge base never travel to GitHub.
-    const { remoteSha, syncBase, syncKeyBase, dirty, lastSyncedAt, ...payload } = record;
+    const { remoteSha, remoteEtag, syncBase, syncKeyBase, dirty, lastSyncedAt, ...payload } = record;
     return payload;
+}
+
+function recordEtag(record) {
+    // Only revalidate a revision this device has both read and merged. Without
+    // both baselines there would be nothing to compare a 304 against.
+    return record.remoteSha && record.syncBase && record.syncKeyBase && typeof record.remoteEtag === 'string'
+        ? record.remoteEtag : '';
 }
 
 function localRevisionChanged(revision) {
@@ -894,7 +1076,7 @@ async function applyRemoteVault(vault, payload, sha, dirty, revision, session, m
         assertSyncSession(session);
         localRevisionChanged(revision);
         const nextRecord = { ...state.record, ...metadata, encryptedVault, remoteSha: sha,
-            syncBase: payload.encryptedVault, syncKeyBase: keyMetadata(payload), dirty, updatedAt: new Date().toISOString() };
+            remoteEtag: state.record.remoteEtag, syncBase: payload.encryptedVault, syncKeyBase: keyMetadata(payload), dirty, updatedAt: new Date().toISOString() };
         // Preserve the record identity used by queued local saves. Publish the merge
         // before IndexedDB yields so an edit during that write extends this version.
         Object.assign(state.record, nextRecord);
@@ -918,13 +1100,25 @@ async function synchronizeOnce(sync, mode, session, resolution) {
         if (repository.private !== true) throw syncError('请选择私有仓库保存加密保险库', 'repository');
         state.verifiedSyncTarget = target;
     }
-    const remote = await readRemoteFile(sync, await remoteRequest('GET', sync));
+    const fetched = await remoteRequestWithMetadata('GET', sync, undefined, { etag: recordEtag(state.record) });
+    assertSyncSession(session);
+    const remoteUnchanged = Boolean(fetched.notModified);
+    let remote = null;
+    if (remoteUnchanged) {
+        // The remote is exactly the revision this device last merged. Keep the
+        // ETag fresh and skip downloading, decrypting and merging the vault.
+        state.record.remoteEtag = fetched.etag || state.record.remoteEtag;
+        if (!state.record.dirty) return;
+    } else {
+        state.record.remoteEtag = fetched.etag || '';
+        remote = await readRemoteFile(sync, fetched.data);
+    }
     assertSyncSession(session);
     await storageQueue;
     assertSyncSession(session);
     assertLocalSaved();
     const revision = state.vaultRevision;
-    if (!remote && (state.record.remoteSha || mode === 'pull')) {
+    if (!remoteUnchanged && !remote && (state.record.remoteSha || mode === 'pull')) {
         throw syncError('远端保险库文件不存在或无权读取，请检查仓库、分支、路径和令牌权限', 'missing');
     }
     if (remote && !state.record.remoteSha && mode !== 'pull') {
@@ -995,25 +1189,30 @@ async function synchronizeOnce(sync, mode, session, resolution) {
             });
         }
     }
-    if (mode === 'pull' || (!state.record.dirty && remote)) return;
+    if (mode === 'pull' || (!state.record.dirty && (remote || remoteUnchanged))) return;
     await storageQueue;
     assertSyncSession(session);
     assertLocalSaved();
     const uploadedRevision = state.vaultRevision;
+    const remoteSha = remote?.sha || (remoteUnchanged ? state.record.remoteSha : null);
     const payload = structuredClone(remoteRecord(state.record));
     state.syncing = 'push';
     refreshSyncStatus();
     // The SHA is the version read and merged above. A 409 restarts GET + merge, never a blind overwrite.
-    const result = await remoteRequest('PUT', sync, {
+    const uploaded = await remoteRequestWithMetadata('PUT', sync, {
         message: 'Update encrypted PasswMana vault', branch: sync.branch,
         content: bytesToBase64(new TextEncoder().encode(JSON.stringify(payload))),
-        ...(remote ? { sha: remote.sha } : {}),
+        ...(remoteSha ? { sha: remoteSha } : {}),
     });
     assertSyncSession(session);
+    const result = uploaded.data;
     if (!result.content?.sha) throw syncError('GitHub 未返回文件版本，请重新检查同步状态', 'format');
     await queueStorage(async () => {
         assertSyncSession(session);
         state.record.remoteSha = result.content.sha;
+        // GitHub does not always send an ETag for a write, so the next poll
+        // revalidates with a full read instead of guessing the new value.
+        state.record.remoteEtag = uploaded.etag || '';
         state.record.syncBase = payload.encryptedVault;
         state.record.syncKeyBase = keyMetadata(payload);
         state.record.dirty = state.vaultRevision !== uploadedRevision;
@@ -1028,9 +1227,18 @@ async function synchronize({ automatic = false, mode = 'sync', resolution } = {}
         || navigator.onLine === false || document.visibilityState === 'hidden')) return;
     if (automatic && Date.now() < state.syncRetryAt) { scheduleAutoSync(0); return; }
     if (!automatic && mode === 'pull' && (!state.record.remoteSha || state.record.dirty)
-        && !confirm('从远端导入会替换本地条目。请先导出加密备份保存本地改动。是否继续？')) return;
+        && !await askConfirm({
+            title: '从远端导入',
+            message: '从远端导入会替换本地条目。请先导出加密备份保存本地改动。是否继续？',
+            confirmLabel: '从远端导入',
+            danger: true,
+        })) return;
     if (!automatic && mode !== 'pull' && !state.record.remoteSha
-        && !confirm('将以本机保险库初始化远端。只有远端不存在密文文件时才会创建。是否继续？')) return;
+        && !await askConfirm({
+            title: '初始化远端',
+            message: '将以本机保险库初始化远端。只有远端不存在密文文件时才会创建。是否继续？',
+            confirmLabel: '初始化远端',
+        })) return;
     const session = state.session;
     const sync = { ...state.vault.sync };
     state.syncController = new AbortController();
@@ -1116,6 +1324,13 @@ async function handleSubmit(event) {
   try {
     form.querySelector('[data-form-error]')?.remove();
     for (const field of form.querySelectorAll('[aria-invalid]')) field.removeAttribute('aria-invalid');
+    if (form.dataset.form === 'confirm') { settleModal(true); return; }
+    if (form.dataset.form === 'prompt') {
+      const value = String(values.get('value') || '').trim();
+      if (!value) throw new Error('请输入名称');
+      settleModal(value);
+      return;
+    }
     if (['setup', 'change-password', 'recovery-reset'].includes(form.dataset.form)) {
       const password = values.get(form.dataset.form === 'setup' ? 'password' : 'newPassword');
       if (typeof password !== 'string' || password.length < 12) throw new Error('主密码至少需要 12 个字符');
@@ -1135,7 +1350,13 @@ async function handleSubmit(event) {
       if (!data) throw new Error('此设备没有可回滚的保险库');
       const prepared = await prepareBackupRestore(data, { masterPassword: values.get('password') });
       assertSyncSession(session);
-      if (!confirm('备份已验证。恢复会替换本机保险库，并保留替换前的加密副本。继续？')) return;
+      const restore = await askConfirm({
+          title: modal.rollback ? '恢复替换前的保险库' : '恢复加密备份',
+          message: '备份已验证。恢复会替换本机保险库，并保留替换前的加密副本。继续？',
+          confirmLabel: modal.rollback ? '回滚保险库' : '恢复备份',
+          danger: true,
+      });
+      if (!restore) return;
       await queueStorage(async () => { assertSyncSession(session); await commitBackupRestore(prepared); });
       state.record = prepared.record;
       state.localSaveError = null;
@@ -1243,6 +1464,7 @@ async function handleSubmit(event) {
       state.vault.sync = next;
       if (targetChanged) {
         state.record.remoteSha = null;
+        state.record.remoteEtag = '';
         delete state.record.syncBase;
         delete state.record.syncKeyBase;
         delete state.record.lastSyncedAt;
@@ -1342,9 +1564,25 @@ function persistEntryDraft() {
 async function closeModal() {
     clearTimeout(state.revealTimer);
     state.revealTimer = null;
+    if (state.modal?.type === 'confirm') { settleModal(false); return; }
+    if (state.modal?.type === 'prompt') { settleModal(null); return; }
+    if (state.modal?.type === 'message') { state.modal = null; render(); return; }
     const form = app.querySelector('form[data-form="add-entry"], form[data-form="edit-entry"]');
     if (form) {
-        if ((state.formDraft || JSON.stringify(formValues(form)) !== initialFormValues.get(form)) && !confirm('放弃这次未保存的编辑？')) return;
+        const changed = state.formDraft || JSON.stringify(formValues(form)) !== initialFormValues.get(form);
+        if (changed) {
+            // Keep the typed values in the modal we return to if the person
+            // chooses to keep editing.
+            captureEntryDraft();
+            if (state.formDraft) state.modal.draft = state.formDraft;
+            const discard = await askConfirm({
+                title: '放弃编辑',
+                message: '放弃这次未保存的编辑？',
+                confirmLabel: '放弃编辑',
+                danger: true,
+            });
+            if (!discard) return;
+        }
         clearTimeout(state.draftTimer);
         state.formDraft = null;
         state.savedDraft = null;
@@ -1352,6 +1590,38 @@ async function closeModal() {
     }
     if (state.modal?.type === 'remote-unlock') state.pendingRemote = null;
     state.modal = null;
+    render();
+}
+
+function settleModal(value, { restore = true } = {}) {
+    const modal = state.modal;
+    const resolve = modal?.resolve;
+    if (typeof resolve !== 'function') return;
+    state.modal = restore && !value && modal.previousModal ? modal.previousModal : null;
+    resolve(value);
+    render();
+}
+
+function askConfirm({ title, message, confirmLabel = '继续', cancelLabel = '取消', danger = false }) {
+    return new Promise((resolve) => {
+        const previousModal = state.modal?.type === 'confirm' || state.modal?.type === 'prompt'
+            ? state.modal.previousModal : state.modal;
+        state.modal = { type: 'confirm', title, message, confirmLabel, cancelLabel, danger, previousModal, resolve };
+        render();
+    });
+}
+
+function askPrompt({ title, message = '', label = '名称', value = '', placeholder = '', confirmLabel = '保存' }) {
+    return new Promise((resolve) => {
+        const previousModal = state.modal?.type === 'confirm' || state.modal?.type === 'prompt'
+            ? state.modal.previousModal : state.modal;
+        state.modal = { type: 'prompt', title, message, label, value, placeholder, confirmLabel, previousModal, resolve };
+        render();
+    });
+}
+
+function showMessage({ title, message, confirmLabel = '知道了' }) {
+    state.modal = { type: 'message', title, message, confirmLabel };
     render();
 }
 
@@ -1474,7 +1744,7 @@ async function handleAction(event) {
     return;
   }
   if (action === 'discard-draft') {
-    if (!confirm('放弃这份未完成的编辑？')) return;
+    if (!await askConfirm({ title: '放弃草稿', message: '放弃这份未完成的编辑？', confirmLabel: '放弃草稿', danger: true })) return;
     state.formDraft = null; state.savedDraft = null;
     await queueStorage(() => clearEncryptedDraft());
     render(); return;
@@ -1527,8 +1797,6 @@ async function handleAction(event) {
     state.favoriteOnly = !state.favoriteOnly;
     control.classList.toggle('active', state.favoriteOnly);
     control.setAttribute('aria-pressed', String(state.favoriteOnly));
-    const label = control.querySelector('[data-favorite-label]');
-    if (label) label.textContent = state.favoriteOnly ? '显示全部条目' : '仅看收藏';
     updateVaultList();
     return;
   }
@@ -1536,6 +1804,19 @@ async function handleAction(event) {
   if (action === 'select-category') { state.category = control.dataset.category; state.modal = null; render(); return; }
   if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
   if (action === 'open-detail') { state.modal = { type: 'detail', id: control.dataset.id, revealed: false }; render(); return; }
+  if (action === 'toggle-favorite') {
+    const entry = state.vault.entries.find((item) => item.id === control.dataset.id);
+    if (!entry) return;
+    entry.favorite = !entry.favorite;
+    await persistVault();
+    updateVaultList();
+    syncFavoriteControls(entry);
+    animateFavorite(entry.id);
+    const target = [...app.querySelectorAll('[data-action="toggle-favorite"]')].find((node) => node.dataset.id === entry.id && node.getClientRects().length);
+    target?.focus();
+    toast(entry.favorite ? '已加入收藏' : '已取消收藏');
+    return;
+  }
   if (action === 'close-modal') { await closeModal(); return; }
   if (action === 'reveal-password') {
     const entry = state.vault.entries.find((item) => item.id === state.modal.id);
@@ -1552,10 +1833,26 @@ async function handleAction(event) {
   }
   if (action === 'copy-password') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.password); return; }
   if (action === 'open-edit') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (!entry) return; state.modal = { type: 'edit', entry: structuredClone(entry) }; render(); return; }
-  if (action === 'delete-entry') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (!confirm(`将“${entry.title}”移至回收站？`)) return; state.vault.entries = state.vault.entries.filter((item) => item.id !== entry.id); state.vault.trash.unshift({ ...entry, deletedAt: new Date().toISOString() }); await persistVault(); state.modal = null; render(); toast('已移至回收站'); return; }
+  if (action === 'delete-entry') {
+    const entry = state.vault.entries.find((item) => item.id === control.dataset.id);
+    if (!await askConfirm({ title: '移至回收站', message: `将“${entry.title}”移至回收站？`, confirmLabel: '移至回收站', danger: true })) return;
+    state.vault.entries = state.vault.entries.filter((item) => item.id !== entry.id);
+    state.vault.trash.unshift({ ...entry, deletedAt: new Date().toISOString() });
+    await persistVault(); state.modal = null; render(); toast('已移至回收站'); return;
+  }
   if (action === 'restore-entry') { const entry = state.vault.trash.find((item) => item.id === control.dataset.id); state.vault.trash = state.vault.trash.filter((item) => item.id !== entry.id); delete entry.deletedAt; entry.updatedAt = new Date().toISOString(); state.vault.entries.unshift(entry); await persistVault(); render(); toast('已恢复条目'); return; }
-  if (action === 'purge-entry') { if (!confirm('永久删除后无法恢复。是否继续？')) return; state.vault.trash = state.vault.trash.filter((item) => item.id !== control.dataset.id); await persistVault(); render(); toast('已永久删除'); return; }
-  if (action === 'add-category') { const category = prompt('分类名称'); if (!category?.trim()) return; if (state.vault.categories.includes(category.trim())) return toast('分类已存在'); state.vault.categories.push(category.trim()); await persistVault(); render(); return; }
+  if (action === 'purge-entry') {
+    if (!await askConfirm({ title: '永久删除', message: '永久删除后无法恢复。是否继续？', confirmLabel: '永久删除', danger: true })) return;
+    state.vault.trash = state.vault.trash.filter((item) => item.id !== control.dataset.id);
+    await persistVault(); render(); toast('已永久删除'); return;
+  }
+  if (action === 'add-category') {
+    const category = await askPrompt({ title: '新增分类', label: '分类名称', placeholder: '例如：工作', confirmLabel: '添加分类' });
+    if (!category) return;
+    if (state.vault.categories.includes(category)) return toast('分类已存在');
+    state.vault.categories.push(category);
+    await persistVault(); render(); return;
+  }
   if (action === 'delete-category') { const category = control.dataset.category; if (DEFAULT_CATEGORIES.includes(category)) return toast('默认分类不可删除'); if (state.vault.entries.some((entry) => entry.category === category)) return toast('该分类仍有条目，无法删除'); state.vault.categories = state.vault.categories.filter((item) => item !== category); await persistVault(); render(); return; }
   if (action === 'open-sync') { state.modal = { type: 'sync' }; render(); return; }
   if (action === 'open-sync-config') { state.modal = { type: 'sync-config' }; render(); return; }
@@ -1569,10 +1866,10 @@ async function handleAction(event) {
   if (action === 'lock') { lockVault(); return; }
 }
 
-app.addEventListener('click', (event) => { handleAction(event).catch((error) => toast(error.message || '操作失败')); });
+app.addEventListener('click', (event) => { handleAction(event).catch((error) => { toast(error.message || '操作失败'); }); });
 app.addEventListener('submit', handleSubmit);
 app.addEventListener('input', (event) => {
-    if (event.target.dataset.input === 'search') { state.search = event.target.value; updateVaultList(); }
+    if (event.target.dataset.input === 'search') { state.search = event.target.value; scheduleVaultListUpdate(); }
     const form = event.target.closest('form');
     if (event.target.name === 'password' || event.target.name === 'newPassword') {
         const help = form?.querySelector('[data-password-strength]');
@@ -1596,7 +1893,12 @@ app.addEventListener('invalid', (event) => {
     showFormError(form, event.target.validity.valueMissing ? '请填写此项' : event.target.validity.tooShort ? '主密码至少需要 12 个字符' : '请检查输入格式', event.target.name);
 }, true);
 app.addEventListener('change', async (event) => {
-  if (event.target.dataset.input === 'category') { state.category = event.target.value; updateVaultList(); }
+  if (event.target.dataset.input === 'sort') {
+    state.sort = Object.hasOwn(SORT_LABELS, event.target.value) ? event.target.value : 'updated';
+    writePreference('passwmana-sort', state.sort);
+    updateVaultList();
+    return;
+  }
   if (event.target.dataset.input === 'lock-minutes') {
     try { state.vault.preferences.lockMinutes = Number(event.target.value); await persistVault(); resetLockTimer(); toast('自动锁定设置已保存'); }
     catch (error) { toast(`设置保存失败：${error.message}`); }
@@ -1622,13 +1924,15 @@ window.addEventListener('beforeunload', (event) => {
 for (const eventName of ['pointerdown', 'keydown', 'touchstart', 'wheel']) document.addEventListener(eventName, resetLockTimer, { passive: true });
 window.addEventListener('online', () => { refreshSyncStatus(); scheduleAutoSync(0); });
 window.addEventListener('offline', refreshSyncStatus);
-window.addEventListener('focus', () => scheduleAutoSync(0));
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleAutoSync(0); });
+window.addEventListener('focus', syncOnForeground);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncOnForeground(); });
 window.addEventListener('resize', () => { if (!window.matchMedia('(max-width: 899px)').matches && state.settingsDetail) { state.settingsDetail = false; render(); } });
 
 async function bootstrap() {
   document.documentElement.dataset.mode = readPreference('passwmana-mode') || 'system';
   document.documentElement.dataset.accent = readPreference('passwmana-accent') || 'emerald';
+  const savedSort = readPreference('passwmana-sort');
+  state.sort = Object.hasOwn(SORT_LABELS, savedSort || '') ? savedSort : 'updated';
   applyThemeColor();
   state.record = await dbGet();
   render();

@@ -178,6 +178,14 @@ async function lockThroughUi(page) {
     await page.locator('[data-form="unlock"]').waitFor();
 }
 
+async function confirmDialog(page, expected) {
+    const dialog = page.locator('form[data-form="confirm"]');
+    await dialog.waitFor();
+    if (expected) assert.match(await dialog.textContent(), expected);
+    await dialog.locator('[type="submit"]').click();
+    await dialog.waitFor({ state: 'hidden' });
+}
+
 async function uploadFile(page, action, name, buffer) {
     const chooser = page.waitForEvent('filechooser');
     await visibleClick(page, `[data-action="${action}"]`);
@@ -213,6 +221,7 @@ async function checkKeyboardAndGenerator(page) {
     await form.locator('[data-action="copy-generated"]').click();
     assert.equal(await page.evaluate(() => globalThis.__syntheticClipboard), generated);
     await page.keyboard.press('Escape');
+    await confirmDialog(page, /放弃这次未保存的编辑/);
     await form.waitFor({ state: 'hidden' });
 }
 
@@ -272,7 +281,8 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
     const github = { payload: null, sha: null, version: 0, requests: [], failure: 0, delay: 0 };
     page.on('pageerror', (error) => browserErrors.push(error.message));
     let promptValue = 'Synthetic unused custom category';
-    const observeDialogs = (observedPage) => observedPage.on('dialog', (dialog) => dialog.accept(dialog.type() === 'prompt' ? promptValue : undefined));
+    // Native dialogs are no longer used by the app; any that appear are a bug.
+    const observeDialogs = (observedPage) => observedPage.on('dialog', (dialog) => { browserErrors.push(`native ${dialog.type()} dialog: ${dialog.message()}`); dialog.dismiss(); });
     observeDialogs(page);
     await context.route('**/app.js', async (route) => {
         const source = await fs.promises.readFile(path.join(repositoryRoot, 'app.js'), 'utf8');
@@ -322,10 +332,14 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.locator('[name="recoverySuffix"]').fill(recoveryCode.split('-').at(-1));
         await page.locator('[data-action="finish-setup"]').click();
 
-        await page.getByText('还没有密码条目', { exact: true }).waitFor();
+        await page.getByText('这里还空着', { exact: true }).waitFor();
         await checkSettingsNavigation(page, outputDirectory, mobile, name);
         await setting(page, 'categories', mobile);
         await visibleClick(page, '[data-action="add-category"]');
+        const categoryPrompt = page.locator('[data-form="prompt"]');
+        await categoryPrompt.waitFor();
+        await categoryPrompt.locator('[name="value"]').fill(promptValue);
+        await categoryPrompt.locator('[type="submit"]').click();
         await page.waitForFunction((category) => __testApi.state.vault.categories.includes(category), promptValue);
         const addedCategoryDelete = page.locator(`[data-action="delete-category"][data-category="${promptValue}"]`);
         await addedCategoryDelete.waitFor();
@@ -338,6 +352,14 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
 
         await addEntry(page, 'Synthetic entry');
         await page.locator('.entry').filter({ hasText: 'Synthetic entry' }).click();
+        await page.locator('[data-action="delete-entry"]').click();
+        const deleteDialog = page.locator('[data-form="confirm"]');
+        await deleteDialog.waitFor();
+        assert.match(await deleteDialog.textContent(), /移至回收站/);
+        await page.screenshot({ path: path.join(outputDirectory, `confirm-dialog-${name}.png`), fullPage: true });
+        await page.keyboard.press('Escape');
+        await deleteDialog.waitFor({ state: 'hidden' });
+        assert.ok(await page.locator('[data-action="delete-entry"]').isVisible(), 'Cancel must keep the detail view open');
         await page.locator('[data-action="copy-account"]').click();
         assert.equal(await page.evaluate(() => globalThis.__syntheticClipboard), 'synthetic@example.invalid');
         const websiteLink = page.locator('.modal a[href="https://example.invalid/"]');
@@ -357,6 +379,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.locator('.entry').filter({ hasText: 'Synthetic updated entry' }).waitFor();
         await page.locator('.entry').click();
         await page.locator('[data-action="delete-entry"]').click();
+        await confirmDialog(page, /移至回收站/);
         await page.locator('.entry').waitFor({ state: 'hidden' });
         await setting(page, 'trash', mobile);
         await page.locator('[data-action="restore-entry"]').click();
@@ -468,6 +491,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.evaluate(() => JSON.stringify(__testApi.state.record)), originalRecord);
         await backupForm.locator('[name="password"]').fill(masterPassword);
         await backupForm.locator('[type="submit"]').click();
+        await confirmDialog(page, /备份已验证/);
         await page.locator('[data-form="unlock"]').waitFor();
         await unlock(page);
         assert.equal(await page.evaluate(() => __testApi.state.record.remoteSha), null);
@@ -475,14 +499,17 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
 
         await setting(page, 'sync', mobile);
         const hostileId = 'synthetic" data-injected-test="true"><img src="synthetic-invalid" onerror="globalThis.__migrationInjected=true">';
-        const migrationComplete = page.waitForEvent('dialog', { predicate: (dialog) => dialog.type() === 'alert' && dialog.message().startsWith('迁移完成：') });
+        const migrationComplete = page.locator('.modal h2', { hasText: '迁移完成' }).waitFor();
         await uploadFile(page, 'import-legacy', 'synthetic-legacy.json', Buffer.from(JSON.stringify({ entries: [
             { id: 'synthetic-legacy', siteName: 'Synthetic legacy entry', account: 'test@example.invalid', password: 'synthetic-legacy-password', type: 'Synthetic category' },
             { id: hostileId, siteName: 'Synthetic hostile ID', account: 'test@example.invalid', password: 'synthetic-hostile-password', type: '个人', url: 'javascript:globalThis.__migrationInjected=true' },
         ] })));
+        await confirmDialog(page, /旧版 JSON 包含明文密码/);
         await migrationComplete;
         await page.waitForFunction(() => __testApi.state.vault.entries.length === 3);
         assert.ok(await page.evaluate(() => __testApi.state.vault.categories.includes('Synthetic category')));
+        await page.locator('.modal-foot [data-action="close-modal"]').click();
+        await page.locator('.modal-layer').waitFor({ state: 'hidden' });
         await navigate(page, 'vault', mobile);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         assert.equal(await page.evaluate(() => globalThis.__migrationInjected === true), false);
@@ -490,6 +517,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.locator('.modal a[href^="javascript:"]').count(), 0);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         await page.locator('[data-action="delete-entry"]').click();
+        await confirmDialog(page, /移至回收站/);
         await page.locator('[data-action="delete-entry"]').waitFor({ state: 'hidden' });
         await setting(page, 'trash', mobile);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
@@ -518,6 +546,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await config.waitFor({ state: 'hidden' });
         assert.equal(github.requests.filter((request) => request.url.includes('/contents/')).length, 0, 'First connection must wait for explicit initialization/import');
         await page.locator('[data-action="push-remote"]').click();
+        await confirmDialog(page, /初始化远端/);
         await page.waitForFunction(() => __testApi.state.record.remoteSha && !__testApi.state.syncing);
         assert.ok(github.payload);
         assert.ok(await page.evaluate(() => Boolean(__testApi.state.vaultKey)));
@@ -527,6 +556,14 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await addEntry(page, 'Synthetic automatic entry');
         await page.waitForFunction(() => !__testApi.state.record.dirty && !__testApi.state.syncing);
         assert.ok(github.requests.filter((request) => request.method === 'PUT').length > beforeSavePuts);
+
+        // A second poll without new remote revisions must revalidate, not
+        // download, and must not upload anything.
+        const beforeRevalidate = github.requests.length;
+        await page.evaluate(() => __testApi.synchronize({ automatic: true }));
+        const revalidation = github.requests.slice(beforeRevalidate).filter((request) => request.url.includes('/contents/'));
+        assert.ok(revalidation.length >= 1, 'an idle poll must ask GitHub for the current revision');
+        assert.ok(!revalidation.some((request) => request.method === 'PUT'), 'an unchanged remote must not be uploaded again');
 
         // Simulate another device editing a different entry using the same AES key.
         github.payload = await page.evaluate(async () => {
@@ -549,6 +586,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.ok(await page.evaluate(() => document.activeElement === __draftNode && __draftNode.isConnected));
         assert.equal(await page.locator('.sync-result[role="alert"]').count(), 0);
         await visibleClick(page, '[data-action="close-modal"]');
+        await confirmDialog(page, /放弃这次未保存的编辑/);
         github.delay = 0;
 
         // Remote changes to the entry currently being edited must prevent a stale save.
@@ -570,6 +608,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.ok(await staleEdit.isVisible());
         assert.equal(await page.evaluate((id) => __testApi.state.vault.entries.find((entry) => entry.id === id).title, targetId), 'Synthetic updated entry');
         await visibleClick(page, '[data-action="close-modal"]');
+        await confirmDialog(page, /放弃这次未保存的编辑/);
 
         // Two devices changing the same fields must expose explicit choices.
         github.payload = await page.evaluate(async ({ id, payload }) => {

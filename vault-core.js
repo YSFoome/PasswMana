@@ -119,6 +119,7 @@ export function validateEncryptedRecord(record) {
         validateKeyWrappers(record.syncKeyBase);
     }
     if (record.remoteSha != null) assertString(record.remoteSha, '同步版本', { nonempty: true, maximum: 512 });
+    if (record.remoteEtag != null) assertString(record.remoteEtag, '同步校验标记', { maximum: 512 });
     if (record.dirty !== undefined && typeof record.dirty !== 'boolean') throw formatError('同步状态格式不正确');
     if (record.lastSyncedAt != null) assertTimestamp(record.lastSyncedAt, '最近同步时间');
     return record;
@@ -282,6 +283,7 @@ export async function createVault(masterPassword, recoveryCode) {
         recoveryWrappedVaultKey: await encryptText(rawKey, recoveryKey),
         encryptedVault: await encryptText(JSON.stringify(vault), vaultKey),
         remoteSha: null,
+        remoteEtag: '',
         dirty: true,
     };
     return { record, vaultKey, rawVaultKey: rawKey, vault };
@@ -316,6 +318,7 @@ export async function prepareBackupRestore(data, { masterPassword, recoveryCode 
     delete record.syncKeyBase;
     delete record.lastSyncedAt;
     record.remoteSha = null;
+    record.remoteEtag = '';
     record.dirty = true;
     const prepared = { record: structuredClone(record), ...unlocked };
     preparedRestores.set(prepared, { record, ...unlocked, vault: structuredClone(unlocked.vault) });

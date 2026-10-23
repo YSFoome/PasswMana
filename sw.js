@@ -1,6 +1,6 @@
 // Generated asset hashes are refreshed by node scripts/generate-sw.cjs.
 // BEGIN GENERATED SHELL
-const SHELL_VERSION = '962823d3cd7707d85bbfdb8a2c0ae7f9dca8028ebacf63511122466d47fc953b';
+const SHELL_VERSION = 'c06e1f1ce533be9cb815f2b392e1c5a88539bdb00990bebd617c5b6768a7eb6b';
 const APP_SHELL = [
     {
         "path": "./index.html",
@@ -8,15 +8,15 @@ const APP_SHELL = [
     },
     {
         "path": "./styles.css",
-        "sha256": "6d19c021c26e92cb704fbc9cd8fb9cb54f405d9e4ffd8d63be58d191a3e84fb0"
+        "sha256": "a6973d785e30cd193f7338ac505de576333210819d9620a83b0e9aa9a1c6c7a5"
     },
     {
         "path": "./app.js",
-        "sha256": "d71d143cff19e293bbdaf5f820ce9e8c05982d011112b77dee353d0b174a2da2"
+        "sha256": "78347c09657704511c2e664ffe8572920c1d3821184d46cbc24511ae46855710"
     },
     {
         "path": "./vault-core.js",
-        "sha256": "1fdc3f6c3c604939f8cd23a7fb88c7a3518680519cbe42b1d14c5f6d280abf06"
+        "sha256": "624876da782d834383635b87bf5624ed7b08d544deeac802506d8a5b9d19a90a"
     },
     {
         "path": "./sync-core.js",
@@ -24,7 +24,7 @@ const APP_SHELL = [
     },
     {
         "path": "./ui-helpers.js",
-        "sha256": "6ef78cb302aaf98d697721e2a6da9c3c7fe48758211111933094386890072295"
+        "sha256": "ca9f84d0386c92a8a0f2229dd2abde342ad4d6d6ad37e52f96d81946f21a98b2"
     },
     {
         "path": "./manifest.webmanifest",

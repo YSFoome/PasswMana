@@ -190,6 +190,10 @@ async function scenario(browser, mobile, screenshotDirectory) {
         assert.equal(await resumedDraft.locator('[name="password"]').inputValue(), 'synthetic-update-draft-secret');
         await page.screenshot({ path: path.join(screenshotDirectory, `update-draft-${mobile ? 'mobile' : 'desktop'}.png`), fullPage: true });
         await page.locator('[data-action="close-modal"]:visible').first().click();
+        const discardDraft = page.locator('form[data-form="confirm"]');
+        await discardDraft.waitFor();
+        await discardDraft.locator('[type="submit"]').click();
+        await discardDraft.waitFor({ state: 'hidden' });
 
         // Ordinary static edits remain discoverable even if a manual deployer
         // forgets to regenerate sw.js. Newly added resources still need hashing.
