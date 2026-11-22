@@ -4,6 +4,7 @@ import {
     createVault, unlockWithMaster, unlockWithRecovery, validateVault, validateEncryptedRecord,
     prepareBackupRestore, commitBackupRestore, getRollbackRecord,
     saveEncryptedDraft, loadEncryptedDraft, clearEncryptedDraft,
+    hasDeviceUnlock, saveDeviceUnlock, loadDeviceUnlock, clearDeviceUnlock,
 } from './vault-core.js';
 import { mergeVaultChanges, conflictVaultSnapshot, sameValue, keyMetadata, mergeKeyMetadata } from './sync-core.js';
 
@@ -14,47 +15,54 @@ const SYNC_TIMEOUT_MS = 20000;
 const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
 const REVEAL_TIMEOUT_MS = 30000;
 const CLIPBOARD_CLEAR_MS = 30000;
+const SORT_LABELS = Object.freeze({ updated: '最近更新', title: '名称 A–Z', created: '添加日期' });
 
-import { passwordStrength, generatePassword, safeWebUrl, parseGithubRepository, createClipboardManager, formValues, showFormError, enhanceDialogs, trapDialogKey } from './ui-helpers.js';
+import { passwordStrength, safeWebUrl, parseGithubRepository, createClipboardManager, formValues, showFormError, enhanceDialogs, trapDialogKey, sortEntries } from './ui-helpers.js';
 
 const app = document.getElementById('app');
 const state = {
-  record: null,
-  vaultKey: null,
-  rawVaultKey: null,
-  vault: null,
-  view: 'vault',
-  settingPanel: 'sync',
-  settingsDetail: false,
-  search: '',
-  category: '',
-  favoriteOnly: false,
-  modal: null,
-  syncing: null,
-  syncLastError: null,
-  pendingRemote: null,
-  session: 0,
-  vaultRevision: 0,
-  syncPromise: null,
-  syncController: null,
-  syncTimer: null,
-  syncPollTimer: null,
-  syncRetryCount: 0,
-  syncRetryAt: 0,
-  syncBlocked: false,
-  drawerOpen: false,
-  timer: null,
-  lastActivityAt: Date.now(),
-  localSaveError: null,
-  releaseVaultLock: null,
-  formDraft: null,
-  savedDraft: null,
-  draftTimer: null,
-  lockWarningTimer: null,
-  serviceWorkerRegistration: null,
-  updateReady: false,
-  revealTimer: null,
-  storage: null,
+    record: null,
+    vaultKey: null,
+    rawVaultKey: null,
+    vault: null,
+    view: 'vault',
+    settingPanel: 'sync',
+    settingsDetail: false,
+    search: '',
+    category: '',
+    favoriteOnly: false,
+    sort: 'updated',
+    selectedId: null,
+    inspectorRevealed: false,
+    modal: null,
+    syncing: null,
+    syncLastError: null,
+    pendingRemote: null,
+    session: 0,
+    vaultRevision: 0,
+    syncPromise: null,
+    syncController: null,
+    syncTimer: null,
+    syncPollTimer: null,
+    syncRetryCount: 0,
+    syncRetryAt: 0,
+    syncForegroundAt: 0,
+    syncBlocked: false,
+    drawerOpen: false,
+    timer: null,
+    lastActivityAt: Date.now(),
+    localSaveError: null,
+    releaseVaultLock: null,
+    deviceUnlock: null,
+    resumedByDevice: false,
+    formDraft: null,
+    savedDraft: null,
+    draftTimer: null,
+    lockWarningTimer: null,
+    serviceWorkerRegistration: null,
+    updateReady: false,
+    revealTimer: null,
+    storage: null,
 };
 
 const clipboardManager = createClipboardManager({
@@ -72,20 +80,20 @@ let activeDialog = null;
 let updateRequested = false;
 
 function escapeHtml(value = '') {
-  return String(value).replace(/[&<>'"]/g, (character) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
-  }[character]));
+    return String(value).replace(/[&<>'"]/g, (character) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+    }[character]));
 }
 
 function icon(name, extra = '') {
-  return `<i data-lucide="${name}"${extra ? ` class="${extra}"` : ''}></i>`;
+    return `<i data-lucide="${name}"${extra ? ` class="${extra}"` : ''}></i>`;
 }
 
 let storageQueue = Promise.resolve();
 
 function queueStorage(operation) {
     const result = storageQueue.then(operation);
-    storageQueue = result.catch(() => {});
+    storageQueue = result.catch(() => { });
     return result;
 }
 
@@ -119,26 +127,26 @@ async function persistVault({ dirty = true } = {}) {
 }
 
 function resetLockTimer({ activity = true } = {}) {
-  if (!state.vaultKey) return;
-  if (activity) state.lastActivityAt = Date.now();
-  clearTimeout(state.timer);
-  clearTimeout(state.lockWarningTimer);
-  app.querySelector('[data-lock-warning]')?.remove();
-  if (state.modal?.type === 'recovery-created') return;
-  const minutes = Number(state.vault.preferences?.lockMinutes ?? 5);
-  if (minutes > 0) {
-    const remaining = Math.max(0, minutes * 60 * 1000 - (Date.now() - state.lastActivityAt));
-    state.timer = setTimeout(lockVault, remaining);
-    state.lockWarningTimer = setTimeout(() => {
-      if (!state.vaultKey || app.querySelector('[data-lock-warning]')) return;
-      const warning = document.createElement('div');
-      warning.className = 'lock-warning';
-      warning.dataset.lockWarning = '';
-      warning.setAttribute('role', 'status');
-      warning.innerHTML = '即将自动锁定，未完成的密码编辑会加密保存。<button class="secondary-button" data-action="extend-session">继续使用</button>';
-      app.append(warning);
-    }, Math.max(0, remaining - 30000));
-  }
+    if (!state.vaultKey) return;
+    if (activity) state.lastActivityAt = Date.now();
+    clearTimeout(state.timer);
+    clearTimeout(state.lockWarningTimer);
+    app.querySelector('[data-lock-warning]')?.remove();
+    if (state.modal?.type === 'recovery-created') return;
+    const minutes = Number(state.vault.preferences?.lockMinutes ?? 5);
+    if (minutes > 0) {
+        const remaining = Math.max(0, minutes * 60 * 1000 - (Date.now() - state.lastActivityAt));
+        state.timer = setTimeout(lockVault, remaining);
+        state.lockWarningTimer = setTimeout(() => {
+            if (!state.vaultKey || app.querySelector('[data-lock-warning]')) return;
+            const warning = document.createElement('div');
+            warning.className = 'lock-warning';
+            warning.dataset.lockWarning = '';
+            warning.setAttribute('role', 'status');
+            warning.innerHTML = '即将自动锁定，未完成的密码编辑会加密保存。<button class="secondary-button" data-action="extend-session">继续使用</button>';
+            app.append(warning);
+        }, Math.max(0, remaining - 30000));
+    }
 }
 
 async function acquireVaultLock() {
@@ -146,12 +154,14 @@ async function acquireVaultLock() {
     let report;
     const acquired = new Promise((resolve) => { report = resolve; });
     navigator.locks.request('passwmana-unlocked', { ifAvailable: true }, async (lock) => {
-        if (!lock) { report(false); return; }
+        if (!lock) { report('busy'); return; }
         const released = new Promise((resolve) => { state.releaseVaultLock = resolve; });
-        report(true);
+        report('held');
         await released;
-    }).catch(() => report(false));
-    if (!await acquired) throw new Error('保险库已在另一个标签页解锁，请先锁定该页面');
+    }).catch(() => report('busy'));
+    const outcome = await acquired;
+    if (outcome === 'held') return;
+    throw new Error('保险库已在另一个标签页解锁，请先锁定该页面');
 }
 
 function releaseVaultLock() {
@@ -161,46 +171,86 @@ function releaseVaultLock() {
     if (release) storageQueue.finally(release);
 }
 
-function lockVault() {
-  clearTimeout(state.timer);
-  clearTimeout(state.lockWarningTimer);
-  clearTimeout(state.draftTimer);
-  clearTimeout(state.revealTimer);
-  state.revealTimer = null;
-  captureEntryDraft();
-  if (state.formDraft && state.vaultKey) void persistEntryDraft().catch(() => {});
-  stopSyncSession();
-  releaseVaultLock();
-  state.vaultKey = null;
-  state.rawVaultKey = null;
-  state.vault = null;
-  state.modal = null;
-  state.pendingRemote = null;
-  state.drawerOpen = false;
-  state.formDraft = null;
-  state.savedDraft = null;
-  dialogTrigger = null;
-  render();
+// The unlock screen's device key changes only through the paths below, so the
+// lock itself leaves it alone; `silent` skips the render for callers that
+// repaint themselves.
+function lockVault({ silent = false } = {}) {
+    clearTimeout(state.timer);
+    clearTimeout(state.lockWarningTimer);
+    clearTimeout(state.draftTimer);
+    clearTimeout(state.revealTimer);
+    clearTimeout(vaultListTimer);
+    vaultListTimer = null;
+    state.revealTimer = null;
+    captureEntryDraft();
+    if (state.formDraft && state.vaultKey) void persistEntryDraft().catch(() => { });
+    stopSyncSession();
+    releaseVaultLock();
+    state.vaultKey = null;
+    state.rawVaultKey = null;
+    state.vault = null;
+    state.selectedId = null;
+    state.inspectorRevealed = false;
+    const modalResolve = state.modal?.resolve;
+    if (modalResolve) modalResolve(state.modal.type === 'prompt' ? null : false);
+    state.modal = null;
+    state.pendingRemote = null;
+    state.drawerOpen = false;
+    state.formDraft = null;
+    state.savedDraft = null;
+    state.resumedByDevice = false;
+    dialogTrigger = null;
+    if (!silent) render();
+}
+
+// Enter the unlocked app with an already-decrypted vault. Both the password path
+// and the device-unlock path land here, so drafts and sync start the same way.
+async function enterUnlockedVault(record, { vaultKey, rawVaultKey, vault }, { resumedByDevice = false } = {}) {
+    state.record = record;
+    state.vaultKey = vaultKey;
+    state.rawVaultKey = rawVaultKey;
+    state.vault = vault;
+    state.resumedByDevice = resumedByDevice;
+    state.savedDraft = await loadEncryptedDraft(record, vaultKey, rawVaultKey);
+    pruneTrash();
+    render();
+    if (resumedByDevice) toast('已在此设备免密解锁');
+    resetLockTimer();
+    startSyncSession();
 }
 
 function currentEntries() {
-  const query = state.search.trim().toLocaleLowerCase();
-  return state.vault.entries
-    .filter((entry) => !state.category || entry.category === state.category)
-    .filter((entry) => !state.favoriteOnly || entry.favorite)
-    .filter((entry) => !query || [entry.title, entry.username, entry.category, entry.url, entry.notes].some((value) => String(value || '').toLocaleLowerCase().includes(query)))
-    .sort((a, b) => Number(b.favorite) - Number(a.favorite) || new Date(b.updatedAt) - new Date(a.updatedAt));
+    const query = state.search.trim().toLocaleLowerCase();
+    const matches = state.vault.entries
+        .filter((entry) => !state.category || entry.category === state.category)
+        .filter((entry) => !state.favoriteOnly || entry.favorite)
+        .filter((entry) => !query || searchableEntryText(entry).includes(query));
+    return sortEntries(matches, state.sort);
+}
+
+// Lowercasing every searchable field on each keystroke is the expensive part of
+// filtering a large vault. Entries are replaced on edit, so a WeakMap cache is
+// invalidated naturally without re-indexing the whole vault.
+const entrySearchIndex = new WeakMap();
+function searchableEntryText(entry) {
+    let text = entrySearchIndex.get(entry);
+    if (text === undefined) {
+        text = [entry.title, entry.username, entry.category, entry.url, entry.notes]
+            .map((value) => String(value || '').toLocaleLowerCase()).join('\n');
+        entrySearchIndex.set(entry, text);
+    }
+    return text;
 }
 
 function timeLabel(iso) {
-  const time = Date.parse(iso);
-  if (!Number.isFinite(time)) return '时间未知';
-  const elapsed = Date.now() - time;
-  if (elapsed < 60000) return '刚刚';
-  if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)} 分钟前`;
-  if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)} 小时前`;
-  if (elapsed < 172800000) return '昨天';
-  return new Date(time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+    const time = Date.parse(iso);
+    if (!Number.isFinite(time)) return '时间未知';
+    const elapsed = Date.now() - time;
+    if (elapsed < 60000) return '刚刚';
+    if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)} 分钟前`;
+    if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)} 小时前`;
+    if (elapsed < 172800000) return '昨天';
+    return new Date(time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
 }
 
 function hostOf(entry) {
@@ -209,133 +259,258 @@ function hostOf(entry) {
     } catch { return ''; }
 }
 
-// A stable identity tab per site, derived from the host so every device agrees
-// without storing anything. Entries without a URL fall back to their title.
-function identityTab(entry) {
-    const key = hostOf(entry) || entry.title || '';
+// A stable colour tone per site/category so equal subjects share a tone without
+// storing anything. Entries without a URL fall back to their title.
+function toneIndex(key) {
     let hash = 0;
     for (let index = 0; index < key.length; index += 1) hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
     return hash % 8;
 }
 
+function identityTab(entry) {
+    return toneIndex(hostOf(entry) || entry.title || '');
+}
+
+function categoryTone(category) {
+    return String(toneIndex(category));
+}
+
 function validTimestamp(value, fallback) {
-  return Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : fallback;
+    return Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : fallback;
 }
 
 function convertLegacyBackup(data, currentVault) {
-  if (!data || !Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
-  const now = new Date().toISOString();
-  const entriesById = new Map(currentVault.entries.map((entry) => [entry.id, entry]));
-  // Deleted entries keep their id in the trash. Re-importing the same legacy
-  // file must not recreate that id in entries: the vault format rejects an id
-  // that exists in both lists, and unlocking would then fail permanently.
-  const trashedIds = new Set(currentVault.trash.map((entry) => entry.id));
-  const categories = new Set([...DEFAULT_CATEGORIES, ...currentVault.categories]);
-  let added = 0;
-  let updated = 0;
-  let skipped = 0;
+    if (!data || !Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
+    const now = new Date().toISOString();
+    const entriesById = new Map(currentVault.entries.map((entry) => [entry.id, entry]));
+    // Deleted entries keep their id in the trash. Re-importing the same legacy
+    // file must not recreate that id in entries: the vault format rejects an id
+    // that exists in both lists, and unlocking would then fail permanently.
+    const trashedIds = new Set(currentVault.trash.map((entry) => entry.id));
+    const categories = new Set([...DEFAULT_CATEGORIES, ...currentVault.categories]);
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
 
-  for (const category of data.customTypes || []) {
-    if (typeof category === 'string' && category.trim()) categories.add(category.trim());
-  }
+    for (const category of data.customTypes || []) {
+        if (typeof category === 'string' && category.trim()) categories.add(category.trim());
+    }
 
-  for (const legacy of data.entries) {
-    const title = String(legacy.siteName || legacy.title || '').trim();
-    const password = typeof legacy.password === 'string' ? legacy.password : '';
-    if (!title || !password) {
-      skipped += 1;
-      continue;
+    for (const legacy of data.entries) {
+        const title = String(legacy.siteName || legacy.title || '').trim();
+        const password = typeof legacy.password === 'string' ? legacy.password : '';
+        if (!title || !password) {
+            skipped += 1;
+            continue;
+        }
+        const category = String(legacy.type || legacy.category || '个人').trim() || '个人';
+        categories.add(category);
+        const id = typeof legacy.id === 'string' && legacy.id ? legacy.id : makeId();
+        if (!entriesById.has(id) && trashedIds.has(id)) {
+            // The person deleted this entry after an earlier migration; a merge should
+            // not resurrect it, and the trash copy already owns the id.
+            skipped += 1;
+            continue;
+        }
+        const createdAt = validTimestamp(legacy.createdAt, validTimestamp(data.exportedAt, now));
+        const updatedAt = validTimestamp(legacy.updatedAt, createdAt);
+        const converted = {
+            id,
+            title,
+            username: String(legacy.account || legacy.username || '').trim(),
+            password,
+            category,
+            url: String(legacy.url || '').trim(),
+            notes: String(legacy.notes || '').trim(),
+            favorite: Boolean(legacy.favorite),
+            createdAt,
+            updatedAt,
+        };
+        const existing = entriesById.get(id);
+        if (!existing) {
+            entriesById.set(id, converted);
+            added += 1;
+        } else if (new Date(updatedAt) > new Date(existing.updatedAt)) {
+            entriesById.set(id, converted);
+            updated += 1;
+        }
     }
-    const category = String(legacy.type || legacy.category || '个人').trim() || '个人';
-    categories.add(category);
-    const id = typeof legacy.id === 'string' && legacy.id ? legacy.id : makeId();
-    if (!entriesById.has(id) && trashedIds.has(id)) {
-      // The person deleted this entry after an earlier migration; a merge should
-      // not resurrect it, and the trash copy already owns the id.
-      skipped += 1;
-      continue;
-    }
-    const createdAt = validTimestamp(legacy.createdAt, validTimestamp(data.exportedAt, now));
-    const updatedAt = validTimestamp(legacy.updatedAt, createdAt);
-    const converted = {
-      id,
-      title,
-      username: String(legacy.account || legacy.username || '').trim(),
-      password,
-      category,
-      url: String(legacy.url || '').trim(),
-      notes: String(legacy.notes || '').trim(),
-      favorite: Boolean(legacy.favorite),
-      createdAt,
-      updatedAt,
-    };
-    const existing = entriesById.get(id);
-    if (!existing) {
-      entriesById.set(id, converted);
-      added += 1;
-    } else if (new Date(updatedAt) > new Date(existing.updatedAt)) {
-      entriesById.set(id, converted);
-      updated += 1;
-    }
-  }
 
-  return { entries: [...entriesById.values()], categories: [...categories], added, updated, skipped };
+    return { entries: [...entriesById.values()], categories: [...categories], added, updated, skipped };
+}
+
+function isMobileViewport() {
+    return window.matchMedia('(max-width: 899px)').matches;
+}
+
+function monogramOf(entry) {
+    const title = String(entry?.title || '').trim();
+    if (!title) return '•';
+    const cjk = title.match(/[\u4e00-\u9fff]/);
+    if (cjk && title.indexOf(cjk[0]) === 0) return cjk[0];
+    const words = title.replace(/[^A-Za-z0-9\u4e00-\u9fff]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return title.slice(0, 1).toUpperCase();
+    if (/[\u4e00-\u9fff]/.test(words[0])) return words[0][0];
+    if (words.length >= 2 && /^[A-Za-z0-9]/.test(words[1])) return (words[0][0] + words[1][0]).toUpperCase();
+    return words[0].slice(0, 2).toUpperCase();
+}
+
+function formatPasswordHtml(password = '') {
+    return [...String(password)].map((ch) => {
+        if (/[0-9]/.test(ch)) return `<span class="pw-d">${escapeHtml(ch)}</span>`;
+        if (!/[A-Za-z]/.test(ch)) return `<span class="pw-s">${escapeHtml(ch)}</span>`;
+        return escapeHtml(ch);
+    }).join('');
+}
+
+function formatShortDate(iso) {
+    const time = Date.parse(iso);
+    if (!Number.isFinite(time)) return '时间未知';
+    const d = new Date(time);
+    return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function resolvedSelectedEntry(entries = currentEntries()) {
+    if (!entries.length) return null;
+    return entries.find((entry) => entry.id === state.selectedId) || entries[0];
 }
 
 function renderRecovery(code) {
-    return `<main class="lock-screen"><section class="lock-panel"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>保存恢复密钥</h1><p>忘记主密码时，它是重新访问保险库的唯一方式。请先离线保存，再确认。</p><div class="recovery-box"><div class="plate"><span class="recovery-code plate-value">${escapeHtml(code)}</span></div><div class="recovery-actions"><button class="secondary-button" data-action="copy-recovery" data-code="${escapeHtml(code)}">${icon('copy')}复制恢复密钥</button></div></div><form class="form-stack" data-form="recovery-confirm"><label class="form-field">核验已保存的密钥最后 4 位<input class="field" name="recoverySuffix" maxlength="4" autocomplete="off" autocapitalize="characters" required /></label><p class="form-help">请从你保存的位置读取。确认之前不会自动隐藏此页面；刷新或关闭页面将无法再次显示密钥。</p><button class="primary-button" type="submit" data-action="finish-setup" disabled>已保存并核验，进入密码库</button></form></section></main>`;
+    return `<main class="lock-screen"><section class="lock-panel"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>保存恢复密钥</h1><p>忘记主密码时，它是重新访问保险库的唯一方式。请先离线保存，再核验最后 4 位。</p><div class="recovery-box"><div class="recovery-surface"><span class="recovery-code">${escapeHtml(code)}</span></div><div class="recovery-actions"><button class="secondary-button" data-action="copy-recovery" data-code="${escapeHtml(code)}">${icon('copy')}复制恢复密钥</button></div></div><form class="form-stack" data-form="recovery-confirm"><label class="form-field">核验已保存的密钥最后 4 位<input class="field machine" name="recoverySuffix" maxlength="4" autocomplete="off" autocapitalize="characters" required /></label><p class="form-help">请从你保存的位置读取。确认之前不会自动隐藏此页面；刷新或关闭页面将无法再次显示密钥。</p><button class="primary-button" type="submit" data-action="finish-setup" disabled>已保存并核验，进入密码库</button></form></section></main>`;
 }
 
 function renderSetup() {
-    return `<main class="lock-screen"><form class="lock-panel" data-form="setup"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>创建本地保险库</h1><p>主密码只在本设备用于解密，请为保险库使用独有的长密码。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="new-password" minlength="12" aria-describedby="password-help" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><p class="form-help" id="password-help" data-password-strength>至少 12 个字符，建议使用多个无关词组成的密码短语。</p><label class="form-field">确认主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label><button class="primary-button" type="submit">${icon('lock-keyhole')}创建保险库</button></div><div class="device-plate"><span>本机加密 · 主密码与密钥不会离开此设备</span></div></form></main>`;
+    return `<main class="lock-screen"><form class="lock-panel" data-form="setup"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>创建本地保险库</h1><p>主密码只在本设备用于解密，请使用独有的长密码。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="new-password" minlength="12" aria-describedby="password-help" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><p class="form-help" id="password-help" data-password-strength>至少 12 个字符，建议使用多个无关词组成的密码短语。</p><label class="form-field">确认主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label><button class="primary-button" type="submit">创建保险库</button></div><div class="device-plate"><span>本机加密保存 · 主密码与密钥不会离开此设备</span></div></form></main>`;
 }
 
 function renderUnlock() {
-  return `<main class="lock-screen"><form class="lock-panel" data-form="unlock"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>解锁保险库</h1><p>输入主密码以在本设备解密保险库。</p><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><button class="primary-button" type="submit">${icon('unlock')}解锁</button><button class="secondary-button" type="button" data-action="open-recovery-reset">使用恢复密钥</button></div><div class="device-plate"><span>本机加密 · 主密码与密钥不会离开此设备</span></div></form></main>`;
+    const deviceButton = state.deviceUnlock ? `<button class="primary-button device-unlock-button" type="submit" data-submit-as="device">${icon('fingerprint')}用此设备继续</button><div class="lock-divider">或使用主密码</div>` : '';
+    // Unchecked by default: sealing the key is a decision the person makes, and a
+    // checkbox that arrives pre-ticked would quietly widen the blast radius.
+    const rememberToggle = `<label class="check-field"><input type="checkbox" name="keepDeviceUnlock" /> 在此设备免密自动解锁</label>`;
+    const passwordButton = state.deviceUnlock ? 'secondary-button' : 'primary-button';
+    return `<main class="lock-screen"><form class="lock-panel" data-form="unlock"><div class="lock-brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><h1>解锁保险库</h1><p>${state.deviceUnlock ? '已在此设备记住密钥，可直接继续或改用主密码。' : '输入主密码以在本设备解密保险库。'}</p><div class="form-stack">${deviceButton}<label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" ${state.deviceUnlock ? '' : 'required'} /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label>${rememberToggle}<button class="${passwordButton}" type="submit">主密码解锁</button><button class="text-button" type="button" data-action="open-recovery-reset">使用恢复密钥</button></div><div class="device-plate"><span>本机加密保存 · 主密码与密钥不会离开此设备</span></div></form></main>`;
 }
 
-function entryTemplate(entry) {
+function entryTemplate(entry, selectedId) {
     const id = escapeHtml(entry.id);
-    const host = hostOf(entry);
-    const url = safeWebUrl(entry.url);
-    const meta = [
-        entry.username ? `<span class="entry-account">${escapeHtml(entry.username)}</span>` : '',
-        host ? `<span class="entry-host">${escapeHtml(host)}</span>` : '',
-        `<span class="entry-time">${timeLabel(entry.updatedAt)}</span>`,
-    ].join('');
-    const tools = `<div class="entry-tools"><button class="row-tool" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制 ${escapeHtml(entry.title)} 的密码">${icon('copy')}</button>${url ? `<a class="row-tool" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="打开网站" aria-label="打开 ${escapeHtml(entry.title)} 的网站">${icon('external-link')}</a>` : ''}</div>`;
-    return `<div class="entry-row" data-tab="${identityTab(entry)}"><button class="entry" data-action="open-detail" data-id="${id}"><span class="entry-name"><span>${escapeHtml(entry.title)}</span>${entry.favorite ? icon('star', 'starred') : ''}</span><span class="entry-meta">${meta}</span></button>${tools}</div>`;
+    const tone = identityTab(entry);
+    const isSelected = entry.id === selectedId;
+    return `<div class="entry-row ${isSelected ? 'selected' : ''}" data-entry-id="${id}"><button class="entry" data-action="open-detail" data-id="${id}"><span class="monogram" data-tab="${tone}">${escapeHtml(monogramOf(entry))}</span><span class="entry-copy"><span class="entry-name"><span>${escapeHtml(entry.title)}</span>${entry.favorite ? icon('star', 'starred') : ''}</span><span class="entry-account">${escapeHtml(entry.username || '未设置账户')}</span></span></button><button class="icon-button entry-copy-btn" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制 ${escapeHtml(entry.title)} 的密码">${icon('copy')}</button></div>`;
 }
 
-function vaultListTemplate() {
-    const entries = currentEntries();
-    if (!state.vault.entries.length) return `<div class="empty-state">${icon('vault')}<h2>还没有密码条目</h2><p>添加第一条密码，或导入已有保险库。</p><div class="empty-actions"><button class="primary-button" data-action="open-add">${icon('plus')}添加第一条密码</button><button class="secondary-button" data-action="import-backup">${icon('upload')}从备份导入</button></div></div>`;
-    if (!entries.length) return `<div class="empty-state">${icon('search')}<h2>没有匹配的密码条目</h2><p>尝试其他关键词，或清除分类与收藏筛选。</p><button class="secondary-button" data-action="clear-filters">清除筛选</button></div>`;
-    // Group by the categories the person maintains, in their own order: the
-    // list should mirror how they think about their accounts, not a flat table.
-    const buckets = new Map();
-    for (const entry of entries) {
-        const known = entry.category && state.vault.categories.includes(entry.category);
-        const label = known ? entry.category : '未分类';
-        if (!buckets.has(label)) buckets.set(label, []);
-        buckets.get(label).push(entry);
+function vaultListTemplate(entries = currentEntries(), selected = resolvedSelectedEntry(entries)) {
+    if (!state.vault.entries.length) return `<div class="empty-state">${icon('vault')}<h2>这里还空着</h2><p>记下第一个账号，它只会加密保存在这台设备。</p><div class="empty-actions"><button class="primary-button" data-action="open-add">${icon('plus')}添加第一条密码</button><button class="secondary-button" data-action="import-backup">${icon('upload')}从备份导入</button></div></div>`;
+    if (!entries.length) return `<div class="empty-state">${icon('search')}<h2>没有找到匹配的条目</h2><p>换个关键词，或者清除当前的筛选。</p><button class="secondary-button" data-action="clear-filters">清除筛选</button></div>`;
+    const selectedId = selected?.id || null;
+    if (state.sort === 'updated' && !state.favoriteOnly) {
+        const pinned = entries.filter((entry) => entry.favorite);
+        const others = entries.filter((entry) => !entry.favorite);
+        if (pinned.length && others.length) {
+            return `<div class="group-heading">收藏</div>${pinned.map((entry) => entryTemplate(entry, selectedId)).join('')}<div class="group-heading">其他</div>${others.map((entry) => entryTemplate(entry, selectedId)).join('')}`;
+        }
     }
-    return [...state.vault.categories, '未分类']
-        .filter((label) => buckets.has(label))
-        .map((label) => `<div class="group-heading"><strong>${escapeHtml(label)}</strong><span>${buckets.get(label).length}</span></div>${buckets.get(label).map(entryTemplate).join('')}`)
-        .join('');
+    return entries.map((entry) => entryTemplate(entry, selectedId)).join('');
 }
+
+function detailFieldsTemplate(entry, revealed) {
+    const id = escapeHtml(entry.id);
+    const url = safeWebUrl(entry.url);
+    const host = hostOf(entry);
+    const secretHtml = revealed ? formatPasswordHtml(entry.password) : '••••••••••••••••';
+    return `<dl class="detail-fields"><div class="detail-row"><dt>账户</dt><dd class="detail-val-row"><span class="machine">${escapeHtml(entry.username || '未设置')}</span><span class="detail-actions"><button class="icon-button" data-action="copy-account" data-id="${id}" title="复制账户" aria-label="复制账户">${icon('copy')}</button></span></dd></div><div class="detail-row"><dt>密码</dt><dd class="detail-val-row"><span class="detail-secret ${revealed ? 'revealed' : 'masked'}" data-secret-value>${secretHtml}</span><span class="detail-actions"><button class="icon-button" data-action="reveal-password" data-id="${id}" title="${revealed ? '隐藏密码' : '显示密码'}" aria-label="${revealed ? '隐藏密码' : '显示密码'}" aria-pressed="${Boolean(revealed)}">${icon(revealed ? 'eye-off' : 'eye')}</button><button class="icon-button" data-action="copy-password" data-id="${id}" title="复制密码" aria-label="复制密码">${icon('copy')}</button></span></dd></div><div class="detail-row"><dt>网站</dt><dd class="detail-val-row">${url ? `<a class="detail-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><span>${escapeHtml(host || url)}</span>${icon('external-link')}</a><span class="detail-actions"><button class="icon-button" data-action="copy-url" data-id="${id}" title="复制网址" aria-label="复制网址">${icon('copy')}</button></span>` : `<span>${escapeHtml(entry.url || '未设置')}</span>`}</dd></div>${entry.notes ? `<div class="detail-row"><dt>备注</dt><dd class="detail-note">${escapeHtml(entry.notes)}</dd></div>` : ''}</dl>`;
+}
+
+function inspectorTemplate(entries = currentEntries(), selected = resolvedSelectedEntry(entries)) {
+    if (state.modal?.type === 'detail') return '';
+    if (!selected) {
+        return `<div class="inspector-empty">${icon('shield-check')}<div>${state.vault.entries.length ? '选择一条密码查看详情' : '添加密码后可在此查看详情'}</div></div>`;
+    }
+    const id = escapeHtml(selected.id);
+    const tone = identityTab(selected);
+    const revealed = Boolean(state.inspectorRevealed && state.selectedId === selected.id);
+    return `<div class="inspector-inner"><header class="insp-header"><span class="monogram lg" data-tab="${tone}">${escapeHtml(monogramOf(selected))}</span><h2 class="insp-title">${escapeHtml(selected.title)}</h2><div class="insp-header-actions"><button class="icon-button favorite-button ${selected.favorite ? 'is-favorite' : ''}" data-action="toggle-favorite" data-id="${id}" aria-pressed="${Boolean(selected.favorite)}" title="${selected.favorite ? '取消收藏' : '收藏'}" aria-label="${selected.favorite ? '取消收藏' : '收藏'}">${icon('star', selected.favorite ? 'starred' : '')}</button><button class="text-button" data-action="open-edit" data-id="${id}">编辑</button></div></header>${detailFieldsTemplate(selected, revealed)}<footer class="insp-footer"><span class="insp-meta">${escapeHtml(selected.category || '未分类')} · 更新于 ${formatShortDate(selected.updatedAt)}</span><button class="danger-text-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}移至回收站</button></footer></div>`;
+}
+
+let vaultListTimer = null;
 
 function updateVaultList() {
-  normalizeCategoryFilter();
-  const list = app.querySelector('[data-vault-list]');
-  if (!list) return;
-  list.innerHTML = vaultListTemplate();
-  drawIcons();
+    clearTimeout(vaultListTimer);
+    vaultListTimer = null;
+    normalizeCategoryFilter();
+    const entries = currentEntries();
+    const selected = resolvedSelectedEntry(entries);
+    if (selected && state.selectedId !== selected.id) {
+        state.selectedId = selected.id;
+        state.inspectorRevealed = false;
+        clearTimeout(state.revealTimer);
+        state.revealTimer = null;
+    } else if (!selected) {
+        state.selectedId = null;
+        state.inspectorRevealed = false;
+    }
+    const list = app.querySelector('[data-vault-list]');
+    if (list) {
+        list.innerHTML = vaultListTemplate(entries, selected);
+        drawIcons(list);
+    }
+    const inspector = app.querySelector('[data-vault-inspector]');
+    if (inspector) {
+        inspector.innerHTML = inspectorTemplate(entries, selected);
+        drawIcons(inspector);
+    }
+}
+
+function updateVaultSelection() {
+    const entries = currentEntries();
+    const selected = resolvedSelectedEntry(entries);
+    app.querySelectorAll('.entry-row').forEach((row) => {
+        row.classList.toggle('selected', Boolean(selected && row.dataset.entryId === selected.id));
+    });
+    const inspector = app.querySelector('[data-vault-inspector]');
+    if (inspector) {
+        inspector.innerHTML = inspectorTemplate(entries, selected);
+        drawIcons(inspector);
+    }
+}
+
+function scheduleVaultListUpdate() {
+    clearTimeout(vaultListTimer);
+    vaultListTimer = setTimeout(() => {
+        vaultListTimer = null;
+        updateVaultList();
+    }, 120);
 }
 
 function normalizeCategoryFilter() {
-  if (state.vault && state.category && !state.vault.categories.includes(state.category)) state.category = '';
+    if (state.vault && state.category && !state.vault.categories.includes(state.category)) state.category = '';
+}
+
+function syncFavoriteControls(entry) {
+    const favorite = Boolean(entry.favorite);
+    const label = `${favorite ? '取消收藏' : '收藏'} ${entry.title}`;
+    const nodes = [...app.querySelectorAll('[data-action="toggle-favorite"]')].filter((node) => node.dataset.id === entry.id);
+    for (const node of nodes) {
+        node.classList.toggle('is-favorite', favorite);
+        node.setAttribute('aria-pressed', String(favorite));
+        node.title = label;
+        node.setAttribute('aria-label', label);
+        const mark = node.querySelector('svg');
+        if (mark) mark.classList.toggle('starred', favorite);
+        const stateLabel = node.querySelector('[data-favorite-state]');
+        if (stateLabel) stateLabel.textContent = favorite ? '已收藏' : '收藏';
+    }
+    drawIcons();
+}
+
+function animateFavorite(entryId) {
+    for (const node of app.querySelectorAll('[data-action="toggle-favorite"]')) {
+        if (node.dataset.id !== entryId) continue;
+        const star = node.querySelector('svg');
+        if (!star) continue;
+        star.classList.add('just-favorited');
+        setTimeout(() => star.classList.remove('just-favorited'), 360);
+    }
 }
 
 function syncStatus() {
@@ -346,7 +521,7 @@ function syncStatus() {
     if (navigator.onLine === false) return { label: '离线保存', detail: '改动已在本地加密保存，联网并解锁后自动同步', status: 'pending', icon: 'cloud-off' };
     if (state.syncLastError) return { label: state.syncBlocked ? '需要处理同步' : '等待重试', detail: state.syncLastError.message, status: 'error', icon: 'circle-alert' };
     if (state.record.dirty) return { label: '等待同步', detail: state.vault.sync.automatic === false ? '改动已在本地保存，请手动同步' : '改动已在本地保存，即将自动同步', status: 'pending', icon: 'cloud-upload' };
-    return { label: '已同步', detail: state.record.lastSyncedAt ? `最近同步：${new Date(state.record.lastSyncedAt).toLocaleString('zh-CN')}` : '本地保险库已与私有仓库同步', status: 'synced', icon: 'cloud-check' };
+    return { label: '已同步', detail: state.record.lastSyncedAt ? `最近同步：${new Date(state.record.lastSyncedAt).toLocaleString('zh-CN')}` : '本地保险库已与私有仓库同步', status: 'synced', icon: 'cloud-upload' };
 }
 
 function refreshSyncStatus() {
@@ -355,9 +530,20 @@ function refreshSyncStatus() {
     app.querySelectorAll('[data-sync-label]').forEach((node) => { node.textContent = status.label; });
     app.querySelectorAll('[data-sync-detail]').forEach((node) => { node.textContent = status.detail; });
     app.querySelectorAll('[data-sync-status]').forEach((node) => { node.dataset.syncStatus = status.status; node.title = status.detail; });
-    app.querySelectorAll('[data-sync-icon]').forEach((node) => { node.innerHTML = icon(status.icon, state.syncing ? 'is-spinning' : ''); });
+    const spinning = state.syncing ? 'is-spinning' : '';
+    const syncNodes = [...app.querySelectorAll('[data-sync-icon]')];
+    for (const node of syncNodes) {
+        // Keep the drawing stable while the same icon shows; only the spinner
+        // has to change between poll and sync.
+        const mark = node.querySelector('svg');
+        if (mark?.dataset.lucide === status.icon) {
+            mark.classList.toggle('is-spinning', Boolean(spinning));
+            continue;
+        }
+        node.innerHTML = icon(status.icon, spinning);
+    }
     app.querySelectorAll('[data-action="pull-remote"], [data-action="push-remote"]').forEach((node) => { node.disabled = Boolean(state.syncing); });
-    drawIcons();
+    drawIcons(syncNodes);
 }
 
 function refreshVaultViews() {
@@ -366,15 +552,11 @@ function refreshVaultViews() {
         const entry = state.vault.entries.find((item) => item.id === state.modal.id);
         if (entry) {
             const secret = app.querySelector('[data-secret-value]');
-            if (secret) secret.textContent = state.modal.revealed ? entry.password : '••••••••••••••••';
+            if (secret) secret.innerHTML = state.modal.revealed ? formatPasswordHtml(entry.password) : '••••••••••••••••';
             const title = app.querySelector('.modal-head h2');
             if (title) title.textContent = entry.title;
+            syncFavoriteControls(entry);
         } else { clearTimeout(state.revealTimer); state.revealTimer = null; state.modal = null; render(); toast('此条目已在其他设备删除'); }
-    }
-    const filter = app.querySelector('[data-input="category"]');
-    if (filter && filter !== document.activeElement) {
-        filter.innerHTML = `<option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join('')}`;
-        filter.value = state.category;
     }
     // Background updates must leave open forms, their values and focus intact.
     for (const [panel, template] of Object.entries({ sync: renderSyncSettings, security: renderSecuritySettings, categories: renderCategoriesSettings, trash: renderTrashSettings })) {
@@ -385,60 +567,70 @@ function refreshVaultViews() {
     updateStorageStatus();
 }
 
+function currentVaultHeading() {
+    if (state.favoriteOnly) return '收藏';
+    if (state.category) return state.category;
+    return '全部密码';
+}
+
 function renderVault() {
-  normalizeCategoryFilter();
-  const status = syncStatus();
-  // The banner is a request for action, not a fixture. It appears only when
-  // something actually needs the person; the rest of the time the vault reports
-  // itself in one quiet line in the sidebar.
-  const actionable = status.status === 'error' || (syncConfigured() && !state.record.remoteSha);
-  const notice = actionable ? `<div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">${icon('refresh-cw')}同步详情</button></div>` : '';
-  return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault">${notice}<div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索名称、账户、网址或备注" value="${escapeHtml(state.search)}" aria-label="搜索密码库" /></div><select class="field filter" data-input="category" aria-label="按分类筛选"><option value="">全部分类</option>${state.vault.categories.map((category) => `<option value="${escapeHtml(category)}" ${state.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select><button class="secondary-button filter-favorite ${state.favoriteOnly ? 'active' : ''}" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}" title="仅看收藏" aria-label="仅看收藏">${icon('star')}</button><button class="secondary-button mobile-filter" data-action="open-category-filter" title="分类筛选" aria-label="分类筛选">${icon('tags')}</button><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增密码</span></button></div><div class="vault-list" data-vault-list>${vaultListTemplate()}</div></section>`;
+    normalizeCategoryFilter();
+    const entries = currentEntries();
+    const selected = resolvedSelectedEntry(entries);
+    if (selected && !state.selectedId) state.selectedId = selected.id;
+    const status = syncStatus();
+    const actionable = status.status === 'error' || (syncConfigured() && !state.record.remoteSha);
+    const notice = actionable ? `<div class="notice" data-sync-status="${status.status}"><div class="notice-copy"><span data-sync-icon>${icon(status.icon)}</span><span data-sync-detail>${escapeHtml(status.detail)}</span></div><button class="secondary-button" data-action="open-sync">同步详情</button></div>` : '';
+    const mobileCats = `<div class="mobile-cats"><button class="mobile-cat ${!state.category && !state.favoriteOnly ? 'active' : ''}" data-action="view" data-view-name="vault">全部</button><button class="mobile-cat ${state.favoriteOnly ? 'active' : ''}" data-action="nav-favorites">收藏</button>${state.vault.categories.map((category) => `<button class="mobile-cat ${!state.favoriteOnly && state.category === category ? 'active' : ''}" data-action="nav-category" data-category="${escapeHtml(category)}">${escapeHtml(category)}</button>`).join('')}</div>`;
+    return `<section class="view ${state.view === 'vault' ? 'active' : ''}" data-view="vault"><div class="vault-workbench"><div class="vault-stream"><div class="toolbar"><div class="search">${icon('search')}<input class="field" type="search" data-input="search" placeholder="搜索" value="${escapeHtml(state.search)}" aria-label="搜索密码库" autocomplete="off" spellcheck="false" autocapitalize="off" /></div><button class="primary-button" data-action="open-add">${icon('plus')}<span>新增</span></button></div>${mobileCats}<div class="stream-scroll">${notice}<div class="list-heading-row"><h1 class="list-heading">${escapeHtml(currentVaultHeading())}</h1><select class="sort-filter" data-input="sort" aria-label="排序方式">${Object.entries(SORT_LABELS).map(([value, label]) => `<option value="${value}" ${state.sort === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div><div class="vault-list" data-vault-list>${vaultListTemplate(entries, selected)}</div></div></div><aside class="vault-inspector" data-vault-inspector>${inspectorTemplate(entries, selected)}</aside></div></section>`;
 }
 
 const settingLabels = { sync: '同步与备份', security: '安全', appearance: '外观', categories: '分类', trash: '回收站' };
 
 function settingsNavigation() {
-  return `<nav class="settings-nav" aria-label="设置分类">${Object.entries(settingLabels).map(([key, label]) => `<button class="${state.settingPanel === key ? 'active' : ''}" ${state.settingPanel === key ? 'aria-current="page"' : ''} data-action="setting-panel" data-panel="${key}">${icon({ sync: 'refresh-cw', security: 'shield-check', appearance: 'paintbrush', categories: 'tags', trash: 'trash-2' }[key])}${label}</button>`).join('')}</nav>`;
+    return `<nav class="settings-nav" aria-label="设置分类">${Object.entries(settingLabels).map(([key, label]) => `<button class="${state.settingPanel === key ? 'active' : ''}" ${state.settingPanel === key ? 'aria-current="page"' : ''} data-action="setting-panel" data-panel="${key}">${icon({ sync: 'refresh-cw', security: 'shield-check', appearance: 'paintbrush', categories: 'tags', trash: 'trash-2' }[key])}${label}</button>`).join('')}</nav>`;
 }
 
 function renderSyncSettings() {
-  const sync = state.vault.sync;
-  const repo = sync.owner && sync.repo ? `${sync.owner} / ${sync.repo}` : '尚未配置私有仓库';
-  return `<section class="settings-panel ${state.settingPanel === 'sync' ? 'active' : ''}" data-panel="sync"><h2>同步与备份</h2><p class="panel-intro">首次连接后，解锁、保存改动和恢复联网时自动同步。页面打开且已解锁时，每分钟检查远端更新。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>私有仓库</strong><span>${escapeHtml(repo)}</span></div><button class="secondary-button" data-action="open-sync-config">配置</button></div><div class="setting-row"><div class="setting-copy"><strong>后台自动同步</strong><span>保存后约 2 秒同步；锁定或关闭页面时暂停</span></div><button class="secondary-button" data-action="toggle-auto-sync" aria-pressed="${sync.automatic !== false}">${sync.automatic === false ? '已关闭' : '已开启'}</button></div><div class="setting-row"><div class="setting-copy"><strong>同步状态</strong><span data-sync-detail>${escapeHtml(syncStatus().detail)}</span></div><button class="secondary-button" data-action="open-sync">详情</button></div><div class="setting-row"><div class="setting-copy"><strong>加密备份</strong><span>导出当前保险库为 .passwmana 文件</span></div><button class="secondary-button" data-action="export-backup">${icon('download')}导出</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复加密备份</strong><span>使用 .passwmana 文件替换本机保险库</span></div><button class="secondary-button" data-action="import-backup">${icon('upload')}恢复</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复替换前的保险库</strong><span>备份恢复后，可使用旧库主密码回滚</span></div><button class="secondary-button" data-action="restore-previous">回滚</button></div><div class="setting-row"><div class="setting-copy"><strong>应用更新</strong><span>更新前会保存加密草稿并锁定</span></div><button class="secondary-button" data-action="check-update">检查更新</button></div><div class="setting-row"><div class="setting-copy"><strong>迁移旧版备份</strong><span>从旧版明文 JSON 合并条目与分类</span></div><button class="secondary-button" data-action="import-legacy">${icon('file-input')}迁移</button></div></div></section>`;
+    const sync = state.vault.sync;
+    const repo = sync.owner && sync.repo ? `${sync.owner} / ${sync.repo}` : '尚未配置私有仓库';
+    return `<section class="settings-panel ${state.settingPanel === 'sync' ? 'active' : ''}" data-panel="sync"><h2>同步与备份</h2><p class="panel-intro">首次连接后，解锁、保存改动和恢复联网时自动同步密文。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>私有仓库</strong><span class="machine">${escapeHtml(repo)}</span></div><button class="secondary-button" data-action="open-sync-config">配置</button></div><div class="setting-row"><div class="setting-copy"><strong>后台自动同步</strong><span>保存后静默同步；锁定或关闭页面时暂停</span></div><button class="switch" data-action="toggle-auto-sync" aria-pressed="${sync.automatic !== false}" aria-label="后台自动同步" title="后台自动同步"></button></div><div class="setting-row"><div class="setting-copy"><strong>同步状态</strong><span data-sync-detail>${escapeHtml(syncStatus().detail)}</span></div><button class="secondary-button" data-action="open-sync">详情</button></div><div class="setting-row"><div class="setting-copy"><strong>加密备份</strong><span>导出当前保险库为 .passwmana 密文文件</span></div><button class="secondary-button" data-action="export-backup">${icon('download')}导出</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复加密备份</strong><span>使用 .passwmana 文件替换本机保险库</span></div><button class="secondary-button" data-action="import-backup">${icon('upload')}恢复</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复替换前的保险库</strong><span>备份恢复后，可使用旧库主密码回滚</span></div><button class="text-button" data-action="restore-previous">回滚</button></div><div class="setting-row"><div class="setting-copy"><strong>应用更新</strong><span>更新前会保存加密草稿并锁定</span></div><button class="text-button" data-action="check-update">检查更新</button></div><div class="setting-row"><div class="setting-copy"><strong>迁移旧版备份</strong><span>从旧版明文 JSON 本地合并并重新加密</span></div><button class="text-button" data-action="import-legacy">迁移</button></div></div></section>`;
 }
 
 function renderSecuritySettings() {
-  const storageButtonHidden = !state.storage?.supported || state.storage.persisted;
-  return `<section class="settings-panel ${state.settingPanel === 'security' ? 'active' : ''}" data-panel="security"><h2>安全</h2><p class="panel-intro">主密码不会离开本设备。解锁后密钥只保留在当前会话内存中。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>自动锁定</strong><span>无操作后自动清除解锁密钥</span></div><select class="field inline-select" data-input="lock-minutes"><option value="0" ${state.vault.preferences.lockMinutes === 0 ? 'selected' : ''}>关闭</option><option value="1" ${state.vault.preferences.lockMinutes === 1 ? 'selected' : ''}>1 分钟</option><option value="5" ${state.vault.preferences.lockMinutes === 5 ? 'selected' : ''}>5 分钟</option><option value="15" ${state.vault.preferences.lockMinutes === 15 ? 'selected' : ''}>15 分钟</option><option value="30" ${state.vault.preferences.lockMinutes === 30 ? 'selected' : ''}>30 分钟</option></select></div><div class="setting-row"><div class="setting-copy"><strong>主密码</strong><span>只更新保险库密钥的主密码包装</span></div><button class="secondary-button" data-action="open-change-password">修改</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复密钥</strong><span>创建时生成，请保存在离线可信位置</span></div><span class="setting-copy"><span>不可再次显示</span></span></div><div class="setting-row"><div class="setting-copy"><strong>本地存储保护</strong><span data-storage-detail>${escapeHtml(storageStatusText())}</span></div><button class="secondary-button" data-action="request-storage-persist" ${storageButtonHidden ? 'hidden' : ''}>申请</button></div></div></section>`;
+    const storageButtonHidden = !state.storage?.supported || state.storage.persisted;
+    const device = state.deviceUnlock
+        ? `<div class="setting-row"><div class="setting-copy"><strong>免密自动解锁</strong><span>已开启。密钥由浏览器保管，打开或刷新后直接进入密码库。</span></div><button class="secondary-button" data-action="open-disable-device-unlock">关闭</button></div>`
+        : `<div class="setting-row"><div class="setting-copy"><strong>免密自动解锁</strong><span>验证主密码后可将密钥交给浏览器保管在本机，免去逐次输入。</span></div><button class="secondary-button" data-action="open-enable-device-unlock">开启</button></div>`;
+    return `<section class="settings-panel ${state.settingPanel === 'security' ? 'active' : ''}" data-panel="security"><h2>安全</h2><p class="panel-intro">主密码不会离开本设备，解锁后的密钥仅保存在当前会话内存中。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>自动锁定</strong><span>无操作后清除解锁密钥</span></div><select class="field inline-select" data-input="lock-minutes"><option value="0" ${state.vault.preferences.lockMinutes === 0 ? 'selected' : ''}>关闭</option><option value="1" ${state.vault.preferences.lockMinutes === 1 ? 'selected' : ''}>1 分钟</option><option value="5" ${state.vault.preferences.lockMinutes === 5 ? 'selected' : ''}>5 分钟</option><option value="15" ${state.vault.preferences.lockMinutes === 15 ? 'selected' : ''}>15 分钟</option><option value="30" ${state.vault.preferences.lockMinutes === 30 ? 'selected' : ''}>30 分钟</option></select></div>${device}<div class="setting-row"><div class="setting-copy"><strong>主密码</strong><span>只更新保险库密钥的主密码包装</span></div><button class="secondary-button" data-action="open-change-password">修改</button></div><div class="setting-row"><div class="setting-copy"><strong>恢复密钥</strong><span>创建时生成，请保存在离线可信位置</span></div><span class="insp-meta">不可再次显示</span></div><div class="setting-row"><div class="setting-copy"><strong>本地存储保护</strong><span data-storage-detail>${escapeHtml(storageStatusText())}</span></div><button class="secondary-button" data-action="request-storage-persist" ${storageButtonHidden ? 'hidden' : ''}>申请</button></div></div></section>`;
 }
 
 function formatBytes(value) {
-  if (!Number.isFinite(value) || value < 0) return '';
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
-  if (value >= 1024 ** 2) return `${Math.round(value / 1024 ** 2)} MB`;
-  if (value >= 1024) return `${Math.round(value / 1024)} KB`;
-  return `${Math.round(value)} B`;
+    if (!Number.isFinite(value) || value < 0) return '';
+    if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+    if (value >= 1024 ** 2) return `${Math.round(value / 1024 ** 2)} MB`;
+    if (value >= 1024) return `${Math.round(value / 1024)} KB`;
+    return `${Math.round(value)} B`;
 }
 
 function storageStatusText() {
-  const storage = state.storage;
-  if (!storage) return '正在检查浏览器存储保护…';
-  if (!storage.supported) return '此浏览器不支持持久化存储申请，请定期导出加密备份。';
-  const usage = storage.usage != null && storage.quota != null
-    ? `已用 ${formatBytes(storage.usage)} / ${formatBytes(storage.quota)}。` : '';
-  return storage.persisted
-    ? `已启用持久化存储，浏览器不会自动清理。${usage}`
-    : `未启用持久化存储，浏览器在空间紧张时可能清除数据。${usage}`;
+    const storage = state.storage;
+    if (!storage) return '正在检查浏览器存储保护…';
+    if (!storage.supported) return '此浏览器不支持持久化存储申请，请定期导出加密备份。';
+    const usage = storage.usage != null && storage.quota != null
+        ? `已用 ${formatBytes(storage.usage)} / ${formatBytes(storage.quota)}。` : '';
+    return storage.persisted
+        ? `已启用持久化存储，浏览器不会自动清理。${usage}`
+        : `未启用持久化存储，浏览器在空间紧张时可能清除数据。${usage}`;
 }
 
 function updateStorageStatus() {
-  if (!state.storage) return;
-  const detail = storageStatusText();
-  app.querySelectorAll('[data-storage-detail]').forEach((node) => { node.textContent = detail; });
-  app.querySelectorAll('[data-action="request-storage-persist"]').forEach((node) => {
-    node.hidden = !state.storage.supported || state.storage.persisted;
-  });
+    if (!state.storage) return;
+    const detail = storageStatusText();
+    app.querySelectorAll('[data-storage-detail]').forEach((node) => { node.textContent = detail; });
+    app.querySelectorAll('[data-action="request-storage-persist"]').forEach((node) => {
+        node.hidden = !state.storage.supported || state.storage.persisted;
+    });
 }
 
 async function requestStoragePersistence() {
@@ -447,75 +639,80 @@ async function requestStoragePersistence() {
 }
 
 async function refreshStorageStatus() {
-  if (typeof navigator.storage?.persisted !== 'function') {
-    state.storage = { supported: false };
-    updateStorageStatus();
-    return;
-  }
-  try {
-    const persisted = await navigator.storage.persisted();
-    let usage = null;
-    let quota = null;
-    if (typeof navigator.storage.estimate === 'function') {
-      const estimate = await navigator.storage.estimate().catch(() => null);
-      if (estimate && Number.isFinite(estimate.usage) && Number.isFinite(estimate.quota)) {
-        usage = estimate.usage;
-        quota = estimate.quota;
-      }
+    if (typeof navigator.storage?.persisted !== 'function') {
+        state.storage = { supported: false };
+        updateStorageStatus();
+        return;
     }
-    state.storage = { supported: true, persisted, usage, quota };
-  } catch {
-    state.storage = { supported: false };
-  }
-  updateStorageStatus();
+    try {
+        const persisted = await navigator.storage.persisted();
+        let usage = null;
+        let quota = null;
+        if (typeof navigator.storage.estimate === 'function') {
+            const estimate = await navigator.storage.estimate().catch(() => null);
+            if (estimate && Number.isFinite(estimate.usage) && Number.isFinite(estimate.quota)) {
+                usage = estimate.usage;
+                quota = estimate.quota;
+            }
+        }
+        state.storage = { supported: true, persisted, usage, quota };
+    } catch {
+        state.storage = { supported: false };
+    }
+    updateStorageStatus();
 }
 
 function renderAppearanceSettings() {
-  const accentNames = { emerald: '松绿', blue: '靛蓝', cyan: '深青', rose: '绛红', amber: '赭黄', graphite: '石墨' };
-  const mode = document.documentElement.dataset.mode || 'system';
-  const accent = document.documentElement.dataset.accent || 'emerald';
-  return `<section class="settings-panel ${state.settingPanel === 'appearance' ? 'active' : ''}" data-panel="appearance"><h2>外观</h2><p class="panel-intro">显示模式和标识色只保存在当前设备。</p><div class="appearance-preview"><div class="mini-app"><div class="mini-side"><span class="mini-mark"></span><span class="mini-line"></span><span class="mini-line"></span></div><div class="mini-content"><strong>密码库</strong><span class="mini-cta">新增密码</span></div></div><div class="preview-text">标识色只用于应用标记、当前导航、链接和焦点框；主要按钮与状态颜色不受影响。</div></div><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>显示模式</strong><span>按系统偏好或固定浅色 / 深色</span></div><div class="segmented" role="group" aria-label="显示模式">${[['system','跟随系统'],['light','浅色'],['dark','深色']].map(([value,label]) => `<button class="${mode === value ? 'active' : ''}" data-action="set-mode" data-mode="${value}">${label}</button>`).join('')}</div></div><div class="setting-row"><div class="setting-copy"><strong>标识色</strong><span>${accentNames[accent]}</span></div><div class="swatches" role="group" aria-label="标识色">${Object.entries(accentNames).map(([value,label]) => `<button class="swatch ${accent === value ? 'active' : ''}" data-accent="${value}" data-action="set-accent" title="${label}" aria-label="${label}">${accent === value ? icon('check') : ''}</button>`).join('')}</div></div></div></section>`;
+    const accentNames = { emerald: '松绿', blue: '靛蓝', cyan: '深青', rose: '绛红', amber: '赭黄', graphite: '石墨' };
+    const mode = document.documentElement.dataset.mode || 'system';
+    const accent = document.documentElement.dataset.accent || 'emerald';
+    return `<section class="settings-panel ${state.settingPanel === 'appearance' ? 'active' : ''}" data-panel="appearance"><h2>外观</h2><p class="panel-intro">显示模式和标识色只保存在当前设备。</p><div class="setting-list"><div class="setting-row"><div class="setting-copy"><strong>显示模式</strong><span>按系统偏好或固定浅色 / 深色</span></div><div class="segmented" role="group" aria-label="显示模式">${[['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']].map(([value, label]) => `<button class="${mode === value ? 'active' : ''}" data-action="set-mode" data-mode="${value}">${label}</button>`).join('')}</div></div><div class="setting-row"><div class="setting-copy"><strong>标识色</strong><span>${accentNames[accent]}</span></div><div class="swatches" role="group" aria-label="标识色">${Object.entries(accentNames).map(([value, label]) => `<button class="swatch ${accent === value ? 'active' : ''}" data-accent="${value}" data-action="set-accent" title="${label}" aria-label="${label}">${accent === value ? icon('check') : ''}</button>`).join('')}</div></div></div></section>`;
 }
 
 function renderCategoriesSettings() {
-  return `<section class="settings-panel ${state.settingPanel === 'categories' ? 'active' : ''}" data-panel="categories"><h2>分类</h2><p class="panel-intro">分类用于整理和筛选密码条目，可以按自己的习惯维护。</p><div class="category-list">${state.vault.categories.map((category) => `<div class="category-row"><span><i class="category-dot"></i>${escapeHtml(category)}</span><button class="icon-button" data-action="delete-category" data-category="${escapeHtml(category)}" title="删除分类" aria-label="删除 ${escapeHtml(category)}">${icon('trash-2')}</button></div>`).join('')}</div><button class="secondary-button" data-action="add-category">${icon('plus')}新增分类</button></section>`;
+    return `<section class="settings-panel ${state.settingPanel === 'categories' ? 'active' : ''}" data-panel="categories"><h2>分类</h2><p class="panel-intro">按你的习惯整理和筛选密码条目。</p><div class="category-list">${state.vault.categories.map((category) => `<div class="category-row"><span><i class="category-dot" data-tab="${categoryTone(category)}"></i>${escapeHtml(category)}</span><button class="danger-text-button" data-action="delete-category" data-category="${escapeHtml(category)}" title="删除分类" aria-label="删除 ${escapeHtml(category)}">删除</button></div>`).join('')}</div><button class="secondary-button" data-action="add-category">${icon('plus')}新增分类</button></section>`;
 }
 
 function renderTrashSettings() {
-  const entries = state.vault.trash.sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
-  return `<section class="settings-panel ${state.settingPanel === 'trash' ? 'active' : ''}" data-panel="trash"><h2>回收站</h2><p class="panel-intro">删除的条目保留 30 天，之后会自动永久清除。</p><div class="setting-list">${entries.length ? entries.map((entry) => `<div class="setting-row"><div class="setting-copy"><strong>${escapeHtml(entry.title)}</strong><span>删除于 ${timeLabel(entry.deletedAt)}</span></div><div><button class="secondary-button" data-action="restore-entry" data-id="${escapeHtml(entry.id)}">恢复</button><button class="icon-button" data-action="purge-entry" data-id="${escapeHtml(entry.id)}" title="永久删除" aria-label="永久删除 ${escapeHtml(entry.title)}">${icon('trash-2')}</button></div></div>`).join('') : `<div class="empty-state">${icon('trash-2')}<div>回收站为空</div></div>`}</div></section>`;
+    const entries = [...state.vault.trash].sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
+    return `<section class="settings-panel ${state.settingPanel === 'trash' ? 'active' : ''}" data-panel="trash"><h2>回收站</h2><p class="panel-intro">删除的条目保留 30 天，之后会自动永久清除。</p><div class="setting-list">${entries.length ? entries.map((entry) => `<div class="setting-row"><div class="setting-copy"><strong>${escapeHtml(entry.title)}</strong><span>删除于 ${timeLabel(entry.deletedAt)}</span></div><div class="setting-actions"><button class="secondary-button" data-action="restore-entry" data-id="${escapeHtml(entry.id)}">恢复</button><button class="danger-text-button" data-action="purge-entry" data-id="${escapeHtml(entry.id)}" title="永久删除" aria-label="永久删除 ${escapeHtml(entry.title)}">彻底删除</button></div></div>`).join('') : `<div class="empty-state">${icon('trash-2')}<div>回收站是空的</div></div>`}</div></section>`;
 }
 
 function renderSettings() {
-  return `<section class="view ${state.view === 'settings' ? 'active' : ''} ${state.settingsDetail ? 'settings-detail' : ''}" data-view="settings"><div class="settings-layout">${settingsNavigation()}<div>${renderSyncSettings()}${renderSecuritySettings()}${renderAppearanceSettings()}${renderCategoriesSettings()}${renderTrashSettings()}</div></div></section>`;
+    return `<section class="view ${state.view === 'settings' ? 'active' : ''} ${state.settingsDetail ? 'settings-detail' : ''}" data-view="settings"><div class="settings-scroll"><div class="settings-container"><header class="settings-head"><h1>设置</h1><p>管理同步、安全策略与界面外观。</p></header><div class="settings-layout">${settingsNavigation()}<div>${renderSyncSettings()}${renderSecuritySettings()}${renderAppearanceSettings()}${renderCategoriesSettings()}${renderTrashSettings()}</div></div></div></div></section>`;
 }
 
 function modalTemplate() {
     const modal = state.modal;
     if (!modal) return '';
-    const close = `<button class="icon-button" type="button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button>`;
+    const close = `<button class="icon-button" type="button" data-action="close-modal" title="关闭" aria-label="关闭" ${modal.type === 'confirm' || modal.type === 'prompt' ? 'hidden' : ''}>${icon('x')}</button>`;
     const shell = (title, body, foot = '', form = '') => `<div class="modal-layer open ${form ? 'form-open' : ''}" data-modal-layer><${form ? 'form' : 'section'} class="modal" ${form ? `data-form="${form}"` : ''}><header class="modal-head"><h2>${escapeHtml(title)}</h2>${close}</header><div class="modal-body">${body}</div>${foot ? `<footer class="modal-foot">${foot}</footer>` : ''}</${form ? 'form' : 'section'}></div>`;
-    const cancel = `<button class="secondary-button" type="button" data-action="close-modal">取消</button>`;
-    if (modal.type === 'category-filter') {
-        const options = [['', '全部分类'], ...state.vault.categories.map((category) => [category, category])];
-        return shell('筛选密码', `<button class="secondary-button" data-action="toggle-favorite-filter" aria-pressed="${state.favoriteOnly}">${icon('star')}<span data-favorite-label>${state.favoriteOnly ? '显示全部条目' : '仅看收藏'}</span></button><div class="category-list">${options.map(([value, label]) => `<button class="category-row" data-action="select-category" data-category="${escapeHtml(value)}"><span><i class="category-dot"></i>${escapeHtml(label)}</span>${state.category === value ? icon('check') : ''}</button>`).join('')}</div>`);
+    const cancel = `<button class="text-button" type="button" data-action="close-modal">取消</button>`;
+    if (modal.type === 'confirm') {
+        const body = `${modal.message ? `<p>${escapeHtml(modal.message)}</p>` : ''}`;
+        const confirm = `<button class="${modal.danger ? 'danger-button' : 'primary-button'}" type="submit">${escapeHtml(modal.confirmLabel || '继续')}</button>`;
+        return shell(modal.title, body, `<button class="secondary-button" type="button" data-action="close-modal" data-autofocus>${escapeHtml(modal.cancelLabel || '取消')}</button>${confirm}`, 'confirm');
+    }
+    if (modal.type === 'prompt') {
+        return shell(modal.title, `${modal.message ? `<p>${escapeHtml(modal.message)}</p>` : ''}<label class="form-field">${escapeHtml(modal.label || '名称')}<input class="field" name="value" value="${escapeHtml(modal.value || '')}" placeholder="${escapeHtml(modal.placeholder || '')}" autocomplete="off" required /></label>`, `${cancel}<button class="primary-button" type="submit">${escapeHtml(modal.confirmLabel || '保存')}</button>`, 'prompt');
+    }
+    if (modal.type === 'message') {
+        return shell(modal.title, `<div class="message-body" role="status">${escapeHtml(modal.message)}</div>`, `<button class="primary-button" type="button" data-action="close-modal" data-autofocus>${escapeHtml(modal.confirmLabel || '知道了')}</button>`);
     }
     if (modal.type === 'add' || modal.type === 'edit') {
         const entry = { title: '', username: '', password: '', category: state.vault.categories[0] || '', url: '', notes: '', favorite: false, ...(modal.entry || {}), ...(modal.draft?.values || {}) };
         const categories = [...new Set([...state.vault.categories, entry.category].filter(Boolean))];
-        return shell(modal.type === 'edit' ? '编辑密码' : '新增密码', `<div class="form-grid"><label class="form-field">站点 / 应用<input class="field" name="title" value="${escapeHtml(entry.title)}" required /></label><label class="form-field">分类<select class="field" name="category">${categories.map((category) => `<option ${entry.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select></label><label class="form-field">账户名<input class="field" name="username" value="${escapeHtml(entry.username)}" required /></label><label class="form-field">密码<div class="password-field"><input class="field" name="password" type="password" value="${escapeHtml(entry.password)}" autocomplete="off" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><div class="generator full"><label class="form-field">生成长度<select class="field" data-generator-length>${[16,20,24,32,48,64].map((length) => `<option value="${length}" ${length === 20 ? 'selected' : ''}>${length} 个字符</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="generate-password">${icon('wand-sparkles')}生成随机密码</button><button class="secondary-button" type="button" data-action="copy-generated">${icon('copy')}复制密码</button></div><label class="form-field full">网址<input class="field" name="url" type="url" value="${escapeHtml(entry.url || '')}" placeholder="https://example.com" /></label><label class="form-field full">备注<textarea class="field" name="notes" placeholder="可选备注">${escapeHtml(entry.notes || '')}</textarea></label><label class="form-field full"><span><input name="favorite" type="checkbox" ${entry.favorite ? 'checked' : ''} /> 收藏此条目</span></label></div>`, `${cancel}<button class="primary-button" type="submit">${icon('save')}保存</button>`, modal.type === 'edit' ? 'edit-entry' : 'add-entry');
+        return shell(modal.type === 'edit' ? '编辑密码' : '新增密码', `<div class="form-grid"><label class="form-field">站点或应用<input class="field" name="title" value="${escapeHtml(entry.title)}" required /></label><label class="form-field">分类<select class="field" name="category">${categories.map((category) => `<option ${entry.category === category ? 'selected' : ''}>${escapeHtml(category)}</option>`).join('')}</select></label><label class="form-field">账户名<input class="field machine" name="username" value="${escapeHtml(entry.username)}" required /></label><label class="form-field">密码<div class="password-field"><input class="field machine" name="password" type="password" value="${escapeHtml(entry.password)}" autocomplete="off" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label><label class="form-field full">网站<input class="field machine" name="url" type="url" value="${escapeHtml(entry.url || '')}" placeholder="https://example.com" /></label><label class="form-field full">备注<textarea class="field" name="notes" placeholder="可选备注">${escapeHtml(entry.notes || '')}</textarea></label><label class="check-field full"><input name="favorite" type="checkbox" ${entry.favorite ? 'checked' : ''} /> 收藏此条目</label></div>`, `${cancel}<button class="primary-button" type="submit">保存</button>`, modal.type === 'edit' ? 'edit-entry' : 'add-entry');
     }
     if (modal.type === 'detail') {
         const entry = state.vault.entries.find((item) => item.id === modal.id);
         if (!entry) return '';
         const id = escapeHtml(entry.id);
-        const url = safeWebUrl(entry.url);
-        const host = hostOf(entry);
-        // The secret leads: it is what this screen exists for, and it sits on the
-        // app's one dark surface so nothing competes with reading it.
-        const plate = `<div class="plate secret"><span class="secret-value plate-value" data-secret-value>${modal.revealed ? escapeHtml(entry.password) : '••••••••••••••••'}</span><button class="icon-button" data-action="reveal-password" aria-label="${modal.revealed ? '隐藏密码' : '显示密码'}" aria-pressed="${Boolean(modal.revealed)}">${icon(modal.revealed ? 'eye-off' : 'eye')}</button><button class="primary-button" data-action="copy-password" data-id="${id}">${icon('copy')}复制</button></div>`;
-        const rows = `<div class="detail-row"><dt>账户</dt><dd class="detail-inline"><span>${escapeHtml(entry.username || '未设置')}</span><button class="icon-button" data-action="copy-account" data-id="${id}" title="复制账户" aria-label="复制账户">${icon('copy')}</button></dd></div><div class="detail-row"><dt>网址</dt><dd>${url ? `<a class="detail-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><span class="detail-host">${escapeHtml(host)}</span>${icon('external-link')}</a>` : escapeHtml(entry.url || '未设置')}</dd></div><div class="detail-row"><dt>分类</dt><dd>${escapeHtml(entry.category || '未分类')}</dd></div><div class="detail-row"><dt>更新时间</dt><dd class="detail-when">${new Date(entry.updatedAt).toLocaleString('zh-CN')}</dd></div>${entry.notes ? `<div class="detail-row"><dt>备注</dt><dd class="detail-note">${escapeHtml(entry.notes)}</dd></div>` : ''}`;
-        return shell(entry.title, `${plate}<dl>${rows}</dl>`, `<button class="danger-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}删除</button><button class="secondary-button" data-action="open-edit" data-id="${id}">${icon('pencil')}编辑</button>`);
+        const body = `${detailFieldsTemplate(entry, Boolean(modal.revealed))}<div class="insp-meta">${escapeHtml(entry.category || '未分类')} · 更新于 ${formatShortDate(entry.updatedAt)}</div>`;
+        const remove = `<button class="danger-text-button" data-action="delete-entry" data-id="${id}">${icon('trash-2')}移至回收站</button>`;
+        const favorite = `<button class="icon-button favorite-button ${entry.favorite ? 'is-favorite' : ''}" data-action="toggle-favorite" data-id="${id}" aria-pressed="${Boolean(entry.favorite)}" title="${entry.favorite ? '取消收藏' : '收藏'}" aria-label="${entry.favorite ? '取消收藏' : '收藏'}">${icon('star', entry.favorite ? 'starred' : '')}</button>`;
+        const edit = `<button class="secondary-button" data-action="open-edit" data-id="${id}">编辑</button>`;
+        return shell(entry.title, body, `${remove}${favorite}${edit}`);
     }
     if (modal.type === 'sync') {
         const first = !state.record.remoteSha;
@@ -533,33 +730,82 @@ function modalTemplate() {
             if (typeof value === 'object') return value.entry ? `${value.location === 'trash' ? '回收站' : '密码库'}：${value.entry.title}\n账户：${value.entry.username || '未设置'}\n分类：${value.entry.category || '未设置'}\n备注：${value.entry.notes || '无'}\n密码已隐藏` : '条目变更';
             return String(value);
         };
-        return shell('选择冲突版本', `<p>先保存一份本地备份，再逐项选择。密码默认隐藏；新远端修改会重新检查。</p><button class="secondary-button" type="button" data-action="export-backup">${icon('download')}导出本地加密备份</button><div class="conflict-list">${conflicts.map((conflict, index) => `<fieldset class="conflict-item"><legend>${escapeHtml(conflict.title || '条目')} · ${escapeHtml(({password:'密码',username:'账户',title:'名称',notes:'备注',url:'网址',category:'分类',favorite:'收藏',lockMinutes:'自动锁定',record:'条目状态'})[conflict.field] || conflict.field || '版本')}</legend><label><input type="radio" name="choice-${index}" value="local" required /> 本地：${escapeHtml(preview(conflict, conflict.local))}</label><label><input type="radio" name="choice-${index}" value="remote" required /> 远端：${escapeHtml(preview(conflict, conflict.remote))}</label>${(conflict.field === 'password' || conflict.field === 'record') ? `<button class="secondary-button" type="button" data-action="reveal-conflict" data-index="${index}">查看密码差异</button><div data-conflict-secret="${index}" hidden></div>` : ''}</fieldset>`).join('')}</div>`, `${cancel}<button class="primary-button" type="submit">应用选择并同步</button>`, 'resolve-conflicts');
+        return shell('选择冲突版本', `<p>先保存一份本地备份，再逐项选择。密码默认隐藏；新远端修改会重新检查。</p><button class="secondary-button" type="button" data-action="export-backup">${icon('download')}导出本地加密备份</button><div class="conflict-list">${conflicts.map((conflict, index) => `<fieldset class="conflict-item"><legend>${escapeHtml(conflict.title || '条目')} · ${escapeHtml(({ password: '密码', username: '账户', title: '名称', notes: '备注', url: '网址', category: '分类', favorite: '收藏', lockMinutes: '自动锁定', record: '条目状态' })[conflict.field] || conflict.field || '版本')}</legend><label><input type="radio" name="choice-${index}" value="local" required /> 本地：${escapeHtml(preview(conflict, conflict.local))}</label><label><input type="radio" name="choice-${index}" value="remote" required /> 远端：${escapeHtml(preview(conflict, conflict.remote))}</label>${(conflict.field === 'password' || conflict.field === 'record') ? `<button class="secondary-button" type="button" data-action="reveal-conflict" data-index="${index}">查看密码差异</button><div data-conflict-secret="${index}" hidden></div>` : ''}</fieldset>`).join('')}</div>`, `${cancel}<button class="primary-button" type="submit">应用选择并同步</button>`, 'resolve-conflicts');
     }
     if (modal.type === 'remote-unlock') return shell('首次导入保险库', '<p>输入远端主密码以验证并导入。导入成功后保持解锁。</p><label class="form-field">远端主密码<input class="field" name="password" type="password" autocomplete="current-password" required /></label>', `${cancel}<button class="primary-button" type="submit">验证并导入</button>`, 'remote-unlock');
+    if (modal.type === 'quick-switch') return `<div class="modal-layer open" data-modal-layer><section class="modal quick-switch" role="dialog" aria-modal="true" aria-labelledby="quick-switch-title"><h2 class="visually-hidden" id="quick-switch-title">快速查找密码</h2><div class="quick-head">${icon('search')}<input class="field quick-input" name="quickQuery" value="${escapeHtml(modal.query || '')}" placeholder="快速查找并复制密码…" aria-label="搜索并复制密码" autocomplete="off" spellcheck="false" /><button class="icon-button" type="button" data-action="close-modal" title="关闭" aria-label="关闭">${icon('x')}</button></div><div class="quick-list" data-quick-list>${quickSwitchListTemplate()}</div></section></div>`;
     if (modal.type === 'backup-unlock') return shell(modal.rollback ? '恢复替换前的保险库' : '验证加密备份', '<p>先验证密码和全部数据，验证失败不会覆盖当前保险库。恢复成功后会保留替换前的加密副本。</p><label class="form-field">备份主密码<input class="field" name="password" type="password" autocomplete="off" required /></label>', `${cancel}<button class="primary-button" type="submit">验证并恢复</button>`, 'backup-unlock');
     if (modal.type === 'sync-config') {
         const sync = { ...state.vault.sync, ...(modal.configDraft || {}) };
         const step = modal.step || 1;
         return shell('连接 GitHub 私有仓库', `<ol class="wizard-steps"><li ${step === 1 ? 'aria-current="step"' : ''}>仓库</li><li ${step === 2 ? 'aria-current="step"' : ''}>访问令牌</li><li>首次连接</li></ol><div ${step !== 1 ? 'hidden' : ''}><label class="form-field">仓库地址<input class="field" name="repositoryUrl" type="url" value="${escapeHtml(sync.owner && sync.repo ? `https://github.com/${sync.owner}/${sync.repo}` : '')}" placeholder="https://github.com/owner/private-vault" /></label><p class="form-help">使用你创建的私有仓库，密码库只上传密文。</p><details><summary>高级设置</summary><div class="form-stack"><label class="form-field">分支<input class="field" name="branch" value="${escapeHtml(sync.branch || 'main')}" /></label><label class="form-field">密文文件路径<input class="field" name="path" value="${escapeHtml(sync.path || 'passwmana.vault')}" /></label></div></details></div><div ${step !== 2 ? 'hidden' : ''}><p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 Fine-grained PAT</a>：仅选此私有仓库，授予 Contents 读写权限，并设置有效期。</p><label class="form-field">Fine-grained PAT<div class="password-field"><input class="field" name="token" type="password" value="${escapeHtml(sync.token)}" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-password" aria-label="显示令牌">${icon('eye')}</button></div></label><button class="secondary-button sync-backup" type="button" data-action="test-sync-connection">${icon('plug')}测试连接</button><p role="status" data-connection-result>${escapeHtml(modal.connectionResult || '验证仓库、分支和当前令牌的读写权限。')}</p></div>`, `${cancel}${step === 1 ? '<button class="primary-button" type="button" data-action="wizard-next">下一步</button>' : '<button class="secondary-button" type="button" data-action="wizard-back">上一步</button><button class="primary-button" type="submit">保存并完成连接</button>'}`, 'sync-config');
     }
+    if (modal.type === 'enable-device-unlock') return shell('开启免密自动解锁', `<p>验证一次主密码后，保险库密钥会交给浏览器保管，并只留在本机。之后打开或刷新页面直接进入密码库，不必每次输入。</p><ul class="form-list"><li>密钥不会上传，也不会进入同步、备份或草稿。</li><li>浏览器会把它与网站数据一同视为可删除的数据；申请持久化存储可降低被清理的风险。</li><li>锁定只清除当前页面；在设置 → 安全中关闭，或修改主密码、用恢复密钥重设后，都需要重新输入主密码。</li><li>在共用或不受信任的电脑上请保持关闭。</li></ul><div class="form-stack"><label class="form-field">主密码<div class="password-field"><input class="field" name="password" type="password" autocomplete="current-password" required /><button class="icon-button" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">${icon('eye')}</button></div></label></div>`, `${cancel}<button class="primary-button" type="submit">验证并开启</button>`, 'enable-device-unlock');
+    if (modal.type === 'disable-device-unlock') return shell('关闭免密自动解锁', '<p>将删除浏览器保管的保险库密钥。本页面保持开启，刷新或重新打开后需要输入主密码。</p>', `${cancel}<button class="danger-button" type="submit">关闭并删除密钥</button>`, 'disable-device-unlock');
     if (modal.type === 'change-password') return shell('修改主密码', '<p>新主密码会同步到其他设备；并发修改时会要求选择版本。</p><div class="form-stack"><label class="form-field">当前主密码<input class="field" name="currentPassword" type="password" autocomplete="current-password" required /></label><label class="form-field">新主密码<input class="field" name="newPassword" type="password" autocomplete="new-password" minlength="12" required aria-describedby="new-password-help" /></label><p class="form-help" id="new-password-help" data-password-strength>建议使用独有的长密码短语。</p><label class="form-field">确认新主密码<input class="field" name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required /></label></div>', `${cancel}<button class="primary-button" type="submit">保存新密码</button>`, 'change-password');
     if (modal.type === 'recovery-reset') return shell('使用恢复密钥', '<p>恢复密钥在本机验证；重设的主密码会随保险库同步到其他设备。请先锁定其他打开的标签页。</p><div class="form-stack"><label class="form-field">恢复密钥<input class="field" name="recoveryCode" autocomplete="off" required /></label><label class="form-field">新主密码<input class="field" name="newPassword" type="password" minlength="12" autocomplete="new-password" required /></label><label class="form-field">确认新主密码<input class="field" name="confirmPassword" type="password" minlength="12" autocomplete="new-password" required /></label></div>', `${cancel}<button class="primary-button" type="submit">验证并重设主密码</button>`, 'recovery-reset');
     return '';
 }
 
-function renderApp() {
-  const title = state.view === 'vault' ? '密码库' : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
-  const status = syncStatus();
-  const minutes = state.vault.preferences.lockMinutes;
-  const nav = `<nav class="main-nav"><button class="nav-link ${state.view === 'vault' ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}密码库</button><button class="nav-link ${state.view === 'settings' ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}设置</button></nav>`;
-  const identity = `<div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><div class="brand-note">本机保险库</div>`;
-  const footer = `<div class="nav-footer"><button class="nav-status" data-action="open-sync" data-sync-status="${status.status}"><span data-sync-icon>${icon(status.icon, state.syncing ? 'is-spinning' : '')}</span><span data-sync-label>${escapeHtml(status.label)}</span></button><span class="nav-countdown">${minutes ? `闲置 ${minutes} 分钟后锁定` : '自动锁定已关闭'}</span></div>`;
-  app.innerHTML = `<div class="app-shell"><aside class="side-nav">${identity}${nav}${footer}</aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="${state.settingsDetail ? '返回设置' : '打开导航'}" aria-label="${state.settingsDetail ? '返回设置' : '打开导航'}">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${title}</div><div class="mobile-header-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></div></header><header class="topbar"><h1>${title}</h1><div class="topbar-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="sync-button" data-action="open-sync" data-sync-status="${status.status}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(status.label)}</span>${icon('refresh-cw')}</button></div></header><div class="page">${state.savedDraft ? '<div class="notice draft-notice"><span>有一份未完成的密码编辑</span><div class="empty-actions"><button class="secondary-button" data-action="resume-draft">继续编辑</button><button class="secondary-button" data-action="discard-draft">放弃草稿</button></div></div>' : ''}${state.updateReady ? '<div class="notice"><span>新版本已准备好</span><button class="secondary-button" data-action="apply-update">保存草稿并更新</button></div>' : ''}${renderVault()}${renderSettings()}</div><button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}">${identity}${nav}${footer}</aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap" role="status" aria-live="polite" aria-atomic="true"></div>`;
-  queueMicrotask(drawIcons);
+function sidebarTemplate(status) {
+    const isAll = state.view === 'vault' && !state.favoriteOnly && !state.category;
+    const isFav = state.view === 'vault' && state.favoriteOnly;
+    const isTrash = state.view === 'settings' && state.settingPanel === 'trash';
+    const isSettings = state.view === 'settings' && state.settingPanel !== 'trash';
+    const categories = state.vault.categories.map((category) => `<button class="nav-link ${state.view === 'vault' && !state.favoriteOnly && state.category === category ? 'active' : ''}" data-action="nav-category" data-category="${escapeHtml(category)}"><i class="category-dot" data-tab="${categoryTone(category)}"></i><span>${escapeHtml(category)}</span></button>`).join('');
+    return `<div class="brand"><span class="brand-mark">${icon('shield-check')}</span>PasswMana</div><nav class="nav-group"><button class="nav-link ${isAll ? 'active' : ''}" data-action="view" data-view-name="vault">${icon('vault')}<span>全部密码</span></button><button class="nav-link ${isFav ? 'active' : ''}" data-action="nav-favorites">${icon('star')}<span>收藏</span></button></nav><div class="nav-group"><div class="nav-heading"><span>分类</span><button class="icon-button" data-action="add-category" title="新增分类" aria-label="新增分类">${icon('plus')}</button></div>${categories}</div><nav class="nav-group"><button class="nav-link ${isTrash ? 'active' : ''}" data-action="nav-trash">${icon('trash-2')}<span>回收站</span></button><button class="nav-link ${isSettings ? 'active' : ''}" data-action="view" data-view-name="settings">${icon('settings-2')}<span>设置</span></button></nav><div class="nav-footer"><button class="nav-status" data-action="open-sync" data-sync-status="${status.status}" title="${escapeHtml(status.detail)}"><span class="sync-dot"></span><span data-sync-label>${escapeHtml(status.label)}</span></button><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button></div>`;
 }
 
-function drawIcons() {
-  if (window.lucide) window.lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+function renderApp() {
+    const title = state.view === 'vault' ? currentVaultHeading() : state.settingsDetail ? settingLabels[state.settingPanel] : '设置';
+    const status = syncStatus();
+    const sidebar = sidebarTemplate(status);
+    const notices = `${state.savedDraft ? '<div class="notice draft-notice"><span>有一份未完成的密码编辑</span><div class="empty-actions"><button class="secondary-button" data-action="resume-draft">继续编辑</button><button class="secondary-button" data-action="discard-draft">放弃草稿</button></div></div>' : ''}${state.updateReady ? '<div class="notice"><span>新版本已准备好</span><button class="secondary-button" data-action="apply-update">保存草稿并更新</button></div>' : ''}`;
+    app.innerHTML = `<div class="app-shell"><aside class="side-nav">${sidebar}</aside><main class="content"><header class="mobile-header"><button class="icon-button" id="mobile-left" data-action="mobile-left" title="${state.settingsDetail ? '返回设置' : '打开导航'}" aria-label="${state.settingsDetail ? '返回设置' : '打开导航'}">${icon(state.settingsDetail ? 'arrow-left' : 'menu')}</button><div class="mobile-title">${escapeHtml(title)}</div><div class="mobile-header-actions"><button class="icon-button" data-action="lock" title="立即锁定" aria-label="立即锁定">${icon('lock-keyhole')}</button><button class="icon-button" data-action="open-sync" title="打开同步" aria-label="打开同步">${icon('refresh-cw')}</button></div></header><div class="global-notices">${notices}</div>${renderVault()}${renderSettings()}<button class="mobile-fab" data-action="open-add" title="新增密码" aria-label="新增密码">${icon('plus')}</button></main></div><div class="scrim ${state.drawerOpen ? 'open' : ''}" data-action="close-drawer"></div><aside class="drawer ${state.drawerOpen ? 'open' : ''}">${sidebar}</aside>${modalTemplate()}<div class="toast-wrap" id="toast-wrap" role="status" aria-live="polite" aria-atomic="true"></div>`;
+    queueMicrotask(drawIcons);
+}
+
+const lucideIconNames = new Map();
+
+function lucideIconKey(slug) {
+    let key = lucideIconNames.get(slug);
+    if (!key) {
+        key = slug.split('-').filter(Boolean)
+            .map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+        lucideIconNames.set(slug, key);
+    }
+    return key;
+}
+
+function drawIcons(root = document) {
+    const lucide = window.lucide;
+    if (!lucide) return;
+    // A container works for a region; a list of icons needs its own lookup.
+    const placeholders = (node) => node.querySelectorAll ? node.querySelectorAll('[data-lucide]') : node;
+    // The vendored build exposes per-icon factories, so refreshing one region
+    // never rescans and rewrites every icon in the document.
+    if (!lucide.createElement || !lucide.icons) {
+        lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+        return;
+    }
+    for (const node of [...placeholders(root)]) {
+        if (node instanceof SVGSVGElement) continue;
+        const slug = node.getAttribute('data-lucide');
+        if (!slug) continue;
+        const definition = lucide.icons[lucideIconKey(slug)];
+        if (!definition) {
+            lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+            return;
+        }
+        const svg = lucide.createElement(definition);
+        svg.setAttribute('data-lucide', slug);
+        svg.setAttribute('stroke-width', '1.8');
+        svg.classList.add('lucide', `lucide-${slug}`);
+        for (const name of node.classList) {
+            if (name !== 'lucide' && !name.startsWith('lucide-')) svg.classList.add(name);
+        }
+        node.replaceWith(svg);
+    }
 }
 
 const darkScheme = window.matchMedia?.('(prefers-color-scheme: dark)');
@@ -581,7 +827,7 @@ function applyThemeColor() {
     const meta = document.querySelector('meta[name="theme-color"]');
     if (!meta) return;
     const styles = getComputedStyle(document.documentElement);
-    const color = (effectiveDarkMode() ? styles.getPropertyValue('--paper') : styles.getPropertyValue('--ink')).trim();
+    const color = styles.getPropertyValue('--bg-sidebar').trim();
     if (color) meta.content = color;
 }
 
@@ -607,20 +853,80 @@ function render() {
 }
 
 function toast(message) {
-  let container = document.getElementById('toast-wrap');
-  if (!container) {
-    container = document.createElement('div');
-    container.className = 'toast-wrap';
-    container.id = 'toast-wrap';
-    container.setAttribute('role', 'status');
-    container.setAttribute('aria-live', 'polite');
-    app.append(container);
-  }
-  const node = document.createElement('div');
-  node.className = 'toast';
-  node.textContent = message;
-  container.append(node);
-  setTimeout(() => node.remove(), 2600);
+    let container = document.getElementById('toast-wrap');
+    if (!container) {
+        container = document.createElement('div');
+        container.className = 'toast-wrap';
+        container.id = 'toast-wrap';
+        container.setAttribute('role', 'status');
+        container.setAttribute('aria-live', 'polite');
+        app.append(container);
+    }
+    const node = document.createElement('div');
+    node.className = 'toast';
+    node.textContent = message;
+    container.append(node);
+    setTimeout(() => node.remove(), 2600);
+}
+
+// Seal the vault key for this device. The hot path only records the binding, so
+// a resume never needs the 600k-iteration derivation again.
+async function enableDeviceUnlock(record, rawVaultKey) {
+    try {
+        await queueStorage(() => saveDeviceUnlock(record, rawVaultKey));
+        state.deviceUnlock = await hasDeviceUnlock();
+        await refreshStorageStatus();
+    } catch {
+        // The caller reports the failure; a silent downgrade would leave the setting
+        // looking enabled while the next launch still asks for the password.
+        state.deviceUnlock = false;
+    }
+}
+
+// Keep an enabled device unlock in step with the record after the vault key
+// itself is unchanged but the record it is bound to moved on.
+async function rotateDeviceUnlock() {
+    if (!state.deviceUnlock || !state.record || !state.rawVaultKey) return;
+    await enableDeviceUnlock(state.record, state.rawVaultKey);
+}
+
+async function disableDeviceUnlock({ keepOpen = false } = {}) {
+    try {
+        await queueStorage(() => clearDeviceUnlock());
+    } catch (error) {
+        if (keepOpen) toast(`无法删除设备密钥：${error.message}`);
+        else throw error;
+        return false;
+    }
+    state.deviceUnlock = null;
+    if (keepOpen) toast('已关闭免密自动解锁，刷新后需要输入主密码');
+    return true;
+}
+
+// A reload or a fresh launch on a device that remembers the key lands straight
+// in the vault. Returning nothing means the password screen stays put.
+async function tryAutoResume() {
+    try {
+        await acquireVaultLock();
+        await storageQueue;
+        const record = await dbGet();
+        if (!record) return;
+        state.record = record;
+        state.deviceUnlock = await hasDeviceUnlock();
+        if (!state.deviceUnlock) return;
+        const resumed = await loadDeviceUnlock(record);
+        if (!resumed) {
+            releaseVaultLock();
+            state.deviceUnlock = null;
+            render();
+            toast('此设备的免密解锁已失效，请用主密码解锁');
+            return;
+        }
+        await enterUnlockedVault(record, resumed, { resumedByDevice: true });
+    } catch {
+        // A failed probe must leave the password form usable, never half-locked.
+        if (!state.vaultKey) releaseVaultLock();
+    }
 }
 
 async function copyText(value, message = '已复制；30 秒后尝试清除，后续复制的内容会保留', options = {}) {
@@ -632,16 +938,26 @@ async function copyText(value, message = '已复制；30 秒后尝试清除，�
 function hideRevealedPassword() {
     clearTimeout(state.revealTimer);
     state.revealTimer = null;
-    if (state.modal?.type !== 'detail' || !state.modal.revealed) return;
-    state.modal.revealed = false;
+    if (state.modal?.type === 'detail' && state.modal.revealed) {
+        state.modal.revealed = false;
+    } else if (state.inspectorRevealed) {
+        state.inspectorRevealed = false;
+    } else {
+        return;
+    }
     const secret = app.querySelector('[data-secret-value]');
-    if (secret) secret.textContent = '••••••••••••••••';
+    if (secret) {
+        secret.textContent = '••••••••••••••••';
+        secret.classList.remove('revealed');
+        secret.classList.add('masked');
+    }
     const control = app.querySelector('[data-action="reveal-password"]');
     if (control) {
         control.setAttribute('aria-label', '显示密码');
+        control.setAttribute('title', '显示密码');
         control.setAttribute('aria-pressed', 'false');
         control.innerHTML = icon('eye');
-        drawIcons();
+        drawIcons(control);
     }
 }
 
@@ -686,39 +1002,47 @@ async function importBackup() {
 }
 
 async function importLegacyBackup() {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = '.json,application/json';
-  input.onchange = async () => {
-    const file = input.files?.[0];
-    if (!file) return;
-    try {
-      if (file.size > MAX_IMPORT_BYTES) throw new Error('旧版备份过大，请选择小于 20 MB 的文件');
-      const data = JSON.parse(await file.text());
-      if (data.format === 'passwmana-v1' || data.record?.format === 'passwmana-v1') {
-        throw new Error('这是新版加密备份，请使用“恢复加密备份”');
-      }
-      if (!Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
-      const confirmed = confirm('旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？');
-      if (!confirmed) return;
-      const converted = convertLegacyBackup(data, state.vault);
-      // Validate the merged shape before replacing memory or storage. A bad
-      // legacy field must fail here, not on the next unlock.
-      validateVault({ ...state.vault, entries: converted.entries, categories: converted.categories });
-      state.vault.entries = converted.entries;
-      state.vault.categories = converted.categories;
-      await persistVault();
-      render();
-      alert(`迁移完成：新增 ${converted.added} 项，更新 ${converted.updated} 项，跳过 ${converted.skipped} 项。\n\n旧版 JSON 仍含明文密码，请在确认数据无误后安全删除该文件。`);
-    } catch (error) {
-      toast(`迁移失败: ${error.message}`);
-    }
-  };
-  input.click();
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+            if (file.size > MAX_IMPORT_BYTES) throw new Error('旧版备份过大，请选择小于 20 MB 的文件');
+            const data = JSON.parse(await file.text());
+            if (data.format === 'passwmana-v1' || data.record?.format === 'passwmana-v1') {
+                throw new Error('这是新版加密备份，请使用“恢复加密备份”');
+            }
+            if (!Array.isArray(data.entries)) throw new Error('不是有效的旧版备份');
+            const confirmed = await askConfirm({
+                title: '迁移旧版备份',
+                message: '旧版 JSON 包含明文密码。文件会在当前浏览器内读取并立即加密；启用同步后只上传密文。确认迁移并合并到当前保险库？',
+                confirmLabel: '迁移并合并',
+                danger: true,
+            });
+            if (!confirmed) return;
+            const converted = convertLegacyBackup(data, state.vault);
+            // Validate the merged shape before replacing memory or storage. A bad
+            // legacy field must fail here, not on the next unlock.
+            validateVault({ ...state.vault, entries: converted.entries, categories: converted.categories });
+            state.vault.entries = converted.entries;
+            state.vault.categories = converted.categories;
+            await persistVault();
+            render();
+            showMessage({
+                title: '迁移完成',
+                message: `新增 ${converted.added} 项，更新 ${converted.updated} 项，跳过 ${converted.skipped} 项。\n\n旧版 JSON 仍含明文密码，请在确认数据无误后安全删除该文件。`,
+            });
+        } catch (error) {
+            toast(`迁移失败: ${error.message}`);
+        }
+    };
+    input.click();
 }
 
 function githubHeaders(token) {
-  return { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28' };
+    return { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28' };
 }
 
 function syncError(message, code) {
@@ -743,6 +1067,7 @@ function stopSyncSession() {
     state.syncBlocked = false;
     state.syncRetryCount = 0;
     state.syncRetryAt = 0;
+    state.syncForegroundAt = 0;
     state.verifiedSyncTarget = null;
     state.pendingRemote = null;
     state.syncConflict = null;
@@ -761,15 +1086,32 @@ function scheduleAutoSync(delay = SYNC_DEBOUNCE_MS) {
         || !state.record.remoteSha || state.syncBlocked) return;
     clearTimeout(state.syncTimer);
     if (navigator.onLine === false || document.visibilityState === 'hidden') return;
-    const wait = Math.max(delay, state.syncRetryAt - Date.now(), 0);
-    state.syncTimer = setTimeout(() => { void synchronize({ automatic: true }); }, wait);
+    state.syncTimer = setTimeout(() => { void synchronize({ automatic: true }); }, pendingSyncDelay(delay));
+}
+
+// Foreground events arrive in bursts (focus + visibility, several tabs switching
+// back). Revalidation is cheap but still a request, so collapses them into one.
+const SYNC_FOREGROUND_PAUSE_MS = 10000;
+
+function pendingSyncDelay(delay) {
+    const pause = Date.now() < state.syncForegroundAt + SYNC_FOREGROUND_PAUSE_MS
+        ? state.syncForegroundAt + SYNC_FOREGROUND_PAUSE_MS - Date.now() : 0;
+    return Math.max(delay, state.syncRetryAt - Date.now(), Math.min(pause, SYNC_FOREGROUND_PAUSE_MS), 0);
+}
+
+function syncOnForeground() {
+    if (!state.vaultKey || !syncConfigured() || state.vault.sync.automatic === false || !state.record.remoteSha) return;
+    // An idle tab returning to view only needs to revalidate; edits still sync
+    // through the normal debounce.
+    state.syncForegroundAt = state.record.dirty ? 0 : Date.now();
+    scheduleAutoSync(0);
 }
 
 function assertSyncSession(session) {
     if (session !== state.session || !state.vaultKey) throw new DOMException('同步已取消', 'AbortError');
 }
 
-async function remoteRequest(method, sync, body, { repository = false, blob = '' } = {}) {
+async function remoteRequestWithMetadata(method, sync, body, { repository = false, blob = '', etag = '' } = {}) {
     const encodedPath = sync.path.split('/').map(encodeURIComponent).join('/');
     const root = `https://api.github.com/repos/${encodeURIComponent(sync.owner)}/${encodeURIComponent(sync.repo)}`;
     const url = blob ? `${root}/git/blobs/${encodeURIComponent(blob)}`
@@ -782,12 +1124,22 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
     if (sessionSignal?.aborted) controller.abort();
     const timer = setTimeout(abort, SYNC_TIMEOUT_MS);
     try {
+        const conditional = method === 'GET' && etag && !repository && !blob;
         const response = await fetch(url, {
             method, cache: 'no-store', signal: controller.signal,
-            headers: { ...githubHeaders(sync.token), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+            headers: {
+                ...githubHeaders(sync.token),
+                ...(conditional ? { 'If-None-Match': etag } : {}),
+                ...(body ? { 'Content-Type': 'application/json' } : {}),
+            },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (response.status === 404 && method === 'GET' && !repository && !blob) return null;
+        if (response.status === 404 && method === 'GET' && !repository && !blob) return { data: null, etag: '' };
+        // 304 carries no body and is not charged to the primary rate limit; the
+        // caller already holds the revision this ETag names.
+        if (conditional && response.status === 304) {
+            return { notModified: true, etag: response.headers.get('etag') || etag };
+        }
         const result = await response.json().catch(() => ({}));
         if (!response.ok) {
             const error = new Error(`GitHub 返回 ${response.status}${result.message ? `：${result.message}` : ''}`);
@@ -800,7 +1152,7 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
             }
             throw error;
         }
-        return result;
+        return { data: result, etag: response.headers.get('etag') || '' };
     } catch (error) {
         if (controller.signal.aborted && !sessionSignal?.aborted) {
             const timeout = new Error('连接 GitHub 超时，将稍后重试');
@@ -812,6 +1164,11 @@ async function remoteRequest(method, sync, body, { repository = false, blob = ''
         clearTimeout(timer);
         sessionSignal?.removeEventListener('abort', abort);
     }
+}
+
+async function remoteRequest(method, sync, body, options = {}) {
+    const result = await remoteRequestWithMetadata(method, sync, body, options);
+    return result.data;
 }
 
 function isRetryableSyncError(error) {
@@ -860,8 +1217,15 @@ function decodeRemote(remote) {
 
 function remoteRecord(record) {
     // Device sync bookkeeping and the encrypted merge base never travel to GitHub.
-    const { remoteSha, syncBase, syncKeyBase, dirty, lastSyncedAt, ...payload } = record;
+    const { remoteSha, remoteEtag, syncBase, syncKeyBase, dirty, lastSyncedAt, ...payload } = record;
     return payload;
+}
+
+function recordEtag(record) {
+    // Only revalidate a revision this device has both read and merged. Without
+    // both baselines there would be nothing to compare a 304 against.
+    return record.remoteSha && record.syncBase && record.syncKeyBase && typeof record.remoteEtag === 'string'
+        ? record.remoteEtag : '';
 }
 
 function localRevisionChanged(revision) {
@@ -893,8 +1257,10 @@ async function applyRemoteVault(vault, payload, sha, dirty, revision, session, m
         const encryptedVault = await encryptText(JSON.stringify(vault), state.vaultKey);
         assertSyncSession(session);
         localRevisionChanged(revision);
-        const nextRecord = { ...state.record, ...metadata, encryptedVault, remoteSha: sha,
-            syncBase: payload.encryptedVault, syncKeyBase: keyMetadata(payload), dirty, updatedAt: new Date().toISOString() };
+        const nextRecord = {
+            ...state.record, ...metadata, encryptedVault, remoteSha: sha,
+            remoteEtag: state.record.remoteEtag, syncBase: payload.encryptedVault, syncKeyBase: keyMetadata(payload), dirty, updatedAt: new Date().toISOString()
+        };
         // Preserve the record identity used by queued local saves. Publish the merge
         // before IndexedDB yields so an edit during that write extends this version.
         Object.assign(state.record, nextRecord);
@@ -918,13 +1284,25 @@ async function synchronizeOnce(sync, mode, session, resolution) {
         if (repository.private !== true) throw syncError('请选择私有仓库保存加密保险库', 'repository');
         state.verifiedSyncTarget = target;
     }
-    const remote = await readRemoteFile(sync, await remoteRequest('GET', sync));
+    const fetched = await remoteRequestWithMetadata('GET', sync, undefined, { etag: recordEtag(state.record) });
+    assertSyncSession(session);
+    const remoteUnchanged = Boolean(fetched.notModified);
+    let remote = null;
+    if (remoteUnchanged) {
+        // The remote is exactly the revision this device last merged. Keep the
+        // ETag fresh and skip downloading, decrypting and merging the vault.
+        state.record.remoteEtag = fetched.etag || state.record.remoteEtag;
+        if (!state.record.dirty) return;
+    } else {
+        state.record.remoteEtag = fetched.etag || '';
+        remote = await readRemoteFile(sync, fetched.data);
+    }
     assertSyncSession(session);
     await storageQueue;
     assertSyncSession(session);
     assertLocalSaved();
     const revision = state.vaultRevision;
-    if (!remote && (state.record.remoteSha || mode === 'pull')) {
+    if (!remoteUnchanged && !remote && (state.record.remoteSha || mode === 'pull')) {
         throw syncError('远端保险库文件不存在或无权读取，请检查仓库、分支、路径和令牌权限', 'missing');
     }
     if (remote && !state.record.remoteSha && mode !== 'pull') {
@@ -948,8 +1326,12 @@ async function synchronizeOnce(sync, mode, session, resolution) {
                 assertSyncSession(session);
                 localRevisionChanged(revision);
                 if (mode === 'pull' && !state.record.remoteSha) {
-                    state.pendingRemote = { payload: { ...remoteRecord(payload), remoteSha: remote.sha,
-                        syncBase: payload.encryptedVault, syncKeyBase: remoteMetadata, dirty: false }, sync, revision };
+                    state.pendingRemote = {
+                        payload: {
+                            ...remoteRecord(payload), remoteSha: remote.sha,
+                            syncBase: payload.encryptedVault, syncKeyBase: remoteMetadata, dirty: false
+                        }, sync, revision
+                    };
                     state.modal = { type: 'remote-unlock' };
                     return;
                 }
@@ -975,8 +1357,10 @@ async function synchronizeOnce(sync, mode, session, resolution) {
             }
             conflicts.push(...keyMerge.conflicts);
             if (conflicts.length) {
-                state.syncConflict = { sha: remote.sha, revision, base: conflictVaultSnapshot(base),
-                    local: conflictVaultSnapshot(state.vault), remote: conflictVaultSnapshot(remoteVault), conflicts };
+                state.syncConflict = {
+                    sha: remote.sha, revision, base: conflictVaultSnapshot(base),
+                    local: conflictVaultSnapshot(state.vault), remote: conflictVaultSnapshot(remoteVault), conflicts
+                };
                 throw syncError(keyMerge.conflicts.length
                     ? '两端的主密码设置不同，已暂停同步。请查看冲突并确认所有设备应使用哪一版主密码。'
                     : '两台设备修改了相同字段。请查看冲突并逐项选择保留的版本。', 'conflict');
@@ -995,25 +1379,30 @@ async function synchronizeOnce(sync, mode, session, resolution) {
             });
         }
     }
-    if (mode === 'pull' || (!state.record.dirty && remote)) return;
+    if (mode === 'pull' || (!state.record.dirty && (remote || remoteUnchanged))) return;
     await storageQueue;
     assertSyncSession(session);
     assertLocalSaved();
     const uploadedRevision = state.vaultRevision;
+    const remoteSha = remote?.sha || (remoteUnchanged ? state.record.remoteSha : null);
     const payload = structuredClone(remoteRecord(state.record));
     state.syncing = 'push';
     refreshSyncStatus();
     // The SHA is the version read and merged above. A 409 restarts GET + merge, never a blind overwrite.
-    const result = await remoteRequest('PUT', sync, {
+    const uploaded = await remoteRequestWithMetadata('PUT', sync, {
         message: 'Update encrypted PasswMana vault', branch: sync.branch,
         content: bytesToBase64(new TextEncoder().encode(JSON.stringify(payload))),
-        ...(remote ? { sha: remote.sha } : {}),
+        ...(remoteSha ? { sha: remoteSha } : {}),
     });
     assertSyncSession(session);
+    const result = uploaded.data;
     if (!result.content?.sha) throw syncError('GitHub 未返回文件版本，请重新检查同步状态', 'format');
     await queueStorage(async () => {
         assertSyncSession(session);
         state.record.remoteSha = result.content.sha;
+        // GitHub does not always send an ETag for a write, so the next poll
+        // revalidates with a full read instead of guessing the new value.
+        state.record.remoteEtag = uploaded.etag || '';
         state.record.syncBase = payload.encryptedVault;
         state.record.syncKeyBase = keyMetadata(payload);
         state.record.dirty = state.vaultRevision !== uploadedRevision;
@@ -1028,9 +1417,18 @@ async function synchronize({ automatic = false, mode = 'sync', resolution } = {}
         || navigator.onLine === false || document.visibilityState === 'hidden')) return;
     if (automatic && Date.now() < state.syncRetryAt) { scheduleAutoSync(0); return; }
     if (!automatic && mode === 'pull' && (!state.record.remoteSha || state.record.dirty)
-        && !confirm('从远端导入会替换本地条目。请先导出加密备份保存本地改动。是否继续？')) return;
+        && !await askConfirm({
+            title: '从远端导入',
+            message: '从远端导入会替换本地条目。请先导出加密备份保存本地改动。是否继续？',
+            confirmLabel: '从远端导入',
+            danger: true,
+        })) return;
     if (!automatic && mode !== 'pull' && !state.record.remoteSha
-        && !confirm('将以本机保险库初始化远端。只有远端不存在密文文件时才会创建。是否继续？')) return;
+        && !await askConfirm({
+            title: '初始化远端',
+            message: '将以本机保险库初始化远端。只有远端不存在密文文件时才会创建。是否继续？',
+            confirmLabel: '初始化远端',
+        })) return;
     const session = state.session;
     const sync = { ...state.vault.sync };
     state.syncController = new AbortController();
@@ -1105,216 +1503,278 @@ async function resolveSyncConflicts(choices) {
 }
 
 async function handleSubmit(event) {
-  const form = event.target.closest('form[data-form]');
-  if (!form) return;
-  event.preventDefault();
-  if (form.dataset.submitting) return;
-  form.dataset.submitting = 'true';
-  const submitButton = form.querySelector('[type="submit"]');
-  if (submitButton) submitButton.disabled = true;
-  const values = new FormData(form);
-  try {
-    form.querySelector('[data-form-error]')?.remove();
-    for (const field of form.querySelectorAll('[aria-invalid]')) field.removeAttribute('aria-invalid');
-    if (['setup', 'change-password', 'recovery-reset'].includes(form.dataset.form)) {
-      const password = values.get(form.dataset.form === 'setup' ? 'password' : 'newPassword');
-      if (typeof password !== 'string' || password.length < 12) throw new Error('主密码至少需要 12 个字符');
+    const form = event.target.closest('form[data-form]');
+    if (!form) return;
+    event.preventDefault();
+    if (form.dataset.submitting) return;
+    form.dataset.submitting = 'true';
+    const submitButton = form.querySelector('[type="submit"]');
+    if (submitButton) submitButton.disabled = true;
+    const values = new FormData(form);
+    try {
+        form.querySelector('[data-form-error]')?.remove();
+        for (const field of form.querySelectorAll('[aria-invalid]')) field.removeAttribute('aria-invalid');
+        if (form.dataset.form === 'confirm') { settleModal(true); return; }
+        if (form.dataset.form === 'prompt') {
+            const value = String(values.get('value') || '').trim();
+            if (!value) throw new Error('请输入名称');
+            settleModal(value);
+            return;
+        }
+        if (['setup', 'change-password', 'recovery-reset'].includes(form.dataset.form)) {
+            const password = values.get(form.dataset.form === 'setup' ? 'password' : 'newPassword');
+            if (typeof password !== 'string' || password.length < 12) throw new Error('主密码至少需要 12 个字符');
+        }
+        if (form.dataset.form === 'recovery-confirm') {
+            if (values.get('recoverySuffix').trim().toUpperCase() !== state.modal?.code.split('-').at(-1)) throw new Error('最后 4 位不匹配，请从保存的位置重新核验');
+            state.modal = null;
+            render();
+            resetLockTimer();
+            startSyncSession();
+            return;
+        }
+        if (form.dataset.form === 'backup-unlock') {
+            const session = state.session;
+            const modal = state.modal;
+            const data = modal.rollback ? await getRollbackRecord() : modal.data;
+            if (!data) throw new Error('此设备没有可回滚的保险库');
+            const prepared = await prepareBackupRestore(data, { masterPassword: values.get('password') });
+            assertSyncSession(session);
+            const restore = await askConfirm({
+                title: modal.rollback ? '恢复替换前的保险库' : '恢复加密备份',
+                message: '备份已验证。恢复会替换本机保险库，并保留替换前的加密副本。继续？',
+                confirmLabel: modal.rollback ? '回滚保险库' : '恢复备份',
+                danger: true,
+            });
+            if (!restore) return;
+            await queueStorage(async () => { assertSyncSession(session); await commitBackupRestore(prepared); });
+            state.record = prepared.record;
+            state.localSaveError = null;
+            lockVault();
+            toast('备份已安全恢复，请用备份主密码解锁');
+            return;
+        }
+        if (form.dataset.form === 'resolve-conflicts') {
+            const choices = Object.fromEntries((state.syncConflict?.conflicts || []).map((conflict, index) => [conflict.id, values.get(`choice-${index}`)]));
+            await resolveSyncConflicts(choices);
+            if (state.syncConflict) { render(); toast('版本已变化，请检查最新差异后重新选择'); }
+            else if (!state.syncLastError) { state.modal = null; render(); }
+            else showFormError(form, state.syncLastError.message);
+            return;
+        }
+        if (form.dataset.form === 'setup') {
+            const password = values.get('password');
+            if (password !== values.get('confirmPassword')) throw new Error('两次主密码不一致');
+            await acquireVaultLock();
+            const existing = await dbGet();
+            if (existing) { state.record = existing; releaseVaultLock(); render(); return; }
+            const recoveryCode = formatRecoveryCode();
+            const created = await createVault(password, recoveryCode);
+            state.record = created.record;
+            state.vaultKey = created.vaultKey;
+            state.rawVaultKey = created.rawVaultKey;
+            state.vault = created.vault;
+            await dbPut(state.record);
+            state.modal = { type: 'recovery-created', code: recoveryCode };
+            render();
+            resetLockTimer();
+            return;
+        }
+        if (form.dataset.form === 'unlock') {
+            await acquireVaultLock();
+            await storageQueue;
+            state.record = await dbGet();
+            const session = state.session;
+            const record = state.record;
+            if (values.get('keepDeviceUnlock') && state.deviceUnlock) {
+                // An explicit lock cleared this tab only; the sealed device key still
+                // reopens the same record, so honour the one-tap resume button.
+                const resumed = await loadDeviceUnlock(record);
+                if (!resumed) { releaseVaultLock(); throw new Error('此设备的免密解锁已失效，请输入主密码'); }
+                await enterUnlockedVault(record, resumed, { resumedByDevice: true });
+                return;
+            }
+            const unlocked = await unlockWithMaster(record, values.get('password'));
+            if (session !== state.session || record !== state.record) return;
+            await enterUnlockedVault(record, unlocked);
+            // Only now, once the password proved the key belongs to this vault, may
+            // the key be sealed for the next visit.
+            if (values.get('keepDeviceUnlock')) {
+                await enableDeviceUnlock(state.record, unlocked.rawVaultKey);
+                if (!state.deviceUnlock) toast('保险库已解锁，但无法在此浏览器启用免密解锁');
+            }
+            return;
+        }
+        if (form.dataset.form === 'remote-unlock') {
+            const pending = state.pendingRemote;
+            if (!pending) throw new Error('远端拉取会话已失效，请重新拉取');
+            const session = state.session;
+            const unlocked = await unlockWithMaster(pending.payload, values.get('password'));
+            assertSyncSession(session);
+            localRevisionChanged(pending.revision);
+            validateVault(unlocked.vault);
+            unlocked.vault.sync = pending.sync;
+            stopSyncSession();
+            state.record = pending.payload;
+            state.vaultKey = unlocked.vaultKey;
+            state.rawVaultKey = unlocked.rawVaultKey;
+            state.vault = unlocked.vault;
+            state.record.lastSyncedAt = new Date().toISOString();
+            await persistVault({ dirty: false });
+            state.pendingRemote = null;
+            state.modal = null;
+            render();
+            resetLockTimer();
+            startSyncSession();
+            toast('已从远端拉取，保险库保持解锁');
+            return;
+        }
+        if (form.dataset.form === 'add-entry' || form.dataset.form === 'edit-entry') {
+            const now = new Date().toISOString();
+            const entry = { title: values.get('title').trim(), username: values.get('username').trim(), password: values.get('password'), category: values.get('category'), url: values.get('url').trim(), notes: values.get('notes').trim(), favorite: values.get('favorite') === 'on', updatedAt: now };
+            if (!entry.title || !entry.username || !entry.password) throw new Error('请填写站点、账户和密码');
+            if (form.dataset.form === 'edit-entry') {
+                const index = state.vault.entries.findIndex((item) => item.id === state.modal.entry.id);
+                if (index < 0 || !sameValue(state.vault.entries[index], state.modal.entry)) throw new Error('此条目已在后台更新或删除，请关闭编辑窗口后重新打开');
+                state.vault.entries[index] = { ...state.vault.entries[index], ...entry };
+                state.selectedId = state.vault.entries[index].id;
+            } else {
+                const created = { ...entry, id: makeId(), createdAt: now };
+                state.vault.entries.unshift(created);
+                state.selectedId = created.id;
+            }
+            state.inspectorRevealed = false;
+            clearTimeout(state.revealTimer);
+            state.revealTimer = null;
+            await persistVault();
+            clearTimeout(state.draftTimer);
+            state.formDraft = null;
+            state.savedDraft = null;
+            await queueStorage(() => clearEncryptedDraft());
+            state.modal = null;
+            render();
+            toast('已保存到密码库');
+            return;
+        }
+        if (form.dataset.form === 'sync-config') {
+            const previous = state.vault.sync;
+            const next = { ...syncConfigFromForm(form), automatic: previous.automatic !== false };
+            if (!syncConfigured(next)) throw new Error('请完整填写仓库、分支、路径与令牌');
+            const targetChanged = ['owner', 'repo', 'branch', 'path'].some((key) => previous[key] !== next[key]);
+            stopSyncSession();
+            state.vault.sync = next;
+            if (targetChanged) {
+                state.record.remoteSha = null;
+                state.record.remoteEtag = '';
+                delete state.record.syncBase;
+                delete state.record.syncKeyBase;
+                delete state.record.lastSyncedAt;
+            }
+            await persistVault();
+            state.modal = { type: 'sync' };
+            render();
+            startSyncSession();
+            toast('配置已加密保存，请完成首次连接');
+            return;
+        }
+        if (form.dataset.form === 'enable-device-unlock') {
+            const session = state.session;
+            const record = state.record;
+            const rawVaultKey = state.rawVaultKey;
+            // Deriving the key is slow, so re-check the session and the record after
+            // the password is verified: a background pull must not have swapped in a
+            // different vault while this form was being submitted.
+            const key = await deriveKey(values.get('password'), record.masterSalt);
+            await decryptText(record.wrappedVaultKey, key);
+            assertSyncSession(session);
+            if (record !== state.record) throw new Error('保险库已在后台更新，请关闭窗口后重新验证');
+            await enableDeviceUnlock(record, rawVaultKey);
+            if (!state.deviceUnlock) throw new Error('无法在此浏览器保管设备密钥，请检查网站数据是否被禁止保存');
+            state.modal = null;
+            render();
+            toast('已开启免密自动解锁，下次打开直接进入');
+            return;
+        }
+        if (form.dataset.form === 'disable-device-unlock') {
+            await disableDeviceUnlock({ keepOpen: true });
+            state.modal = null;
+            render();
+            return;
+        }
+        if (form.dataset.form === 'change-password') {
+            const session = state.session;
+            const record = state.record;
+            const rawVaultKey = state.rawVaultKey;
+            const originalWrapping = { masterSalt: record.masterSalt, wrappedVaultKey: structuredClone(record.wrappedVaultKey) };
+            if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
+            const currentKey = await deriveKey(values.get('currentPassword'), state.record.masterSalt);
+            await decryptText(state.record.wrappedVaultKey, currentKey);
+            const newSalt = randomBase64(16);
+            const newKey = await deriveKey(values.get('newPassword'), newSalt);
+            const wrappedVaultKey = await encryptText(rawVaultKey, newKey);
+            assertSyncSession(session);
+            if (record !== state.record) return;
+            if (!sameValue(originalWrapping, { masterSalt: record.masterSalt, wrappedVaultKey: record.wrappedVaultKey })) throw new Error('主密码已在后台更新，请关闭窗口后重新验证');
+            state.record.masterSalt = newSalt;
+            state.record.wrappedVaultKey = wrappedVaultKey;
+            await persistVault();
+            // The master password changed: a device key sealed under the old one must
+            // not keep opening the vault, and its binding is stale after the save.
+            await rotateDeviceUnlock();
+            state.modal = null;
+            render();
+            toast('主密码已更新');
+            return;
+        }
+        if (form.dataset.form === 'recovery-reset') {
+            await acquireVaultLock();
+            await storageQueue;
+            state.record = await dbGet();
+            const session = state.session;
+            const record = state.record;
+            if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
+            const { rawVaultKey } = await unlockWithRecovery(record, values.get('recoveryCode'));
+            const masterSalt = randomBase64(16);
+            const masterKey = await deriveKey(values.get('newPassword'), masterSalt);
+            const wrappedVaultKey = await encryptText(rawVaultKey, masterKey);
+            if (session !== state.session || record !== state.record) return;
+            const next = { ...record, masterSalt, wrappedVaultKey, updatedAt: new Date().toISOString(), dirty: true };
+            await queueStorage(() => dbPut(next));
+            state.record = next;
+            // A recovery reset re-authenticates by recovery key, not by the master
+            // password, so the remembered device unlock is withdrawn.
+            await clearDeviceUnlock().catch(() => { });
+            state.deviceUnlock = null;
+            releaseVaultLock();
+            state.modal = null;
+            render();
+            toast(state.vaultKey ? '主密码已重设，免密自动解锁需要重新开启' : '主密码已重设');
+        }
+    } catch (error) {
+        if (!state.vaultKey) releaseVaultLock();
+        const friendlyError = form.dataset.form === 'unlock' && error.name === 'OperationError'
+            ? '主密码错误，无法解锁保险库'
+            : form.dataset.form === 'enable-device-unlock' && error.name === 'OperationError'
+                ? '当前主密码错误，请输入正确的密码'
+                : form.dataset.form === 'recovery-reset' && error.name === 'OperationError'
+                    ? '恢复密钥无效，无法重设主密码'
+                    : form.dataset.form === 'remote-unlock' && error.name === 'OperationError'
+                        ? '远端主密码错误，无法完成拉取'
+                        : form.dataset.form === 'backup-unlock' && error.name === 'OperationError'
+                            ? '备份主密码错误或密文已损坏，原保险库已保留'
+                            : form.dataset.form === 'change-password' && error.name === 'OperationError'
+                                ? '当前主密码错误，请重新输入'
+                                : (error.message || '操作失败');
+        const mismatch = /两次/.test(friendlyError);
+        let errorField;
+        if (mismatch) errorField = 'confirmPassword';
+        else if (['change-password', 'enable-device-unlock'].includes(form.dataset.form)) errorField = 'currentPassword';
+        else if (form.dataset.form === 'recovery-reset') errorField = 'recoveryCode';
+        showFormError(form, friendlyError, errorField);
+    } finally {
+        delete form.dataset.submitting;
+        if (submitButton) submitButton.disabled = false;
     }
-    if (form.dataset.form === 'recovery-confirm') {
-      if (values.get('recoverySuffix').trim().toUpperCase() !== state.modal?.code.split('-').at(-1)) throw new Error('最后 4 位不匹配，请从保存的位置重新核验');
-      state.modal = null;
-      render();
-      resetLockTimer();
-      startSyncSession();
-      return;
-    }
-    if (form.dataset.form === 'backup-unlock') {
-      const session = state.session;
-      const modal = state.modal;
-      const data = modal.rollback ? await getRollbackRecord() : modal.data;
-      if (!data) throw new Error('此设备没有可回滚的保险库');
-      const prepared = await prepareBackupRestore(data, { masterPassword: values.get('password') });
-      assertSyncSession(session);
-      if (!confirm('备份已验证。恢复会替换本机保险库，并保留替换前的加密副本。继续？')) return;
-      await queueStorage(async () => { assertSyncSession(session); await commitBackupRestore(prepared); });
-      state.record = prepared.record;
-      state.localSaveError = null;
-      lockVault();
-      toast('备份已安全恢复，请用备份主密码解锁');
-      return;
-    }
-    if (form.dataset.form === 'resolve-conflicts') {
-      const choices = Object.fromEntries((state.syncConflict?.conflicts || []).map((conflict, index) => [conflict.id, values.get(`choice-${index}`)]));
-      await resolveSyncConflicts(choices);
-      if (state.syncConflict) { render(); toast('版本已变化，请检查最新差异后重新选择'); }
-      else if (!state.syncLastError) { state.modal = null; render(); }
-      else showFormError(form, state.syncLastError.message);
-      return;
-    }
-    if (form.dataset.form === 'setup') {
-      const password = values.get('password');
-      if (password !== values.get('confirmPassword')) throw new Error('两次主密码不一致');
-      await acquireVaultLock();
-      const existing = await dbGet();
-      if (existing) { state.record = existing; releaseVaultLock(); render(); return; }
-      const recoveryCode = formatRecoveryCode();
-      const created = await createVault(password, recoveryCode);
-      state.record = created.record;
-      state.vaultKey = created.vaultKey;
-      state.rawVaultKey = created.rawVaultKey;
-      state.vault = created.vault;
-      await dbPut(state.record);
-      state.modal = { type: 'recovery-created', code: recoveryCode };
-      render();
-      resetLockTimer();
-      return;
-    }
-    if (form.dataset.form === 'unlock') {
-      await acquireVaultLock();
-      await storageQueue;
-      state.record = await dbGet();
-      const session = state.session;
-      const record = state.record;
-      const unlocked = await unlockWithMaster(record, values.get('password'));
-      if (session !== state.session || record !== state.record) return;
-      state.vaultKey = unlocked.vaultKey;
-      state.rawVaultKey = unlocked.rawVaultKey;
-      state.vault = unlocked.vault;
-      const savedDraft = await loadEncryptedDraft(record, unlocked.vaultKey, unlocked.rawVaultKey);
-      if (session !== state.session || record !== state.record) return;
-      state.savedDraft = savedDraft;
-      pruneTrash();
-      render();
-      resetLockTimer();
-      startSyncSession();
-      return;
-    }
-    if (form.dataset.form === 'remote-unlock') {
-      const pending = state.pendingRemote;
-      if (!pending) throw new Error('远端拉取会话已失效，请重新拉取');
-      const session = state.session;
-      const unlocked = await unlockWithMaster(pending.payload, values.get('password'));
-      assertSyncSession(session);
-      localRevisionChanged(pending.revision);
-      validateVault(unlocked.vault);
-      unlocked.vault.sync = pending.sync;
-      stopSyncSession();
-      state.record = pending.payload;
-      state.vaultKey = unlocked.vaultKey;
-      state.rawVaultKey = unlocked.rawVaultKey;
-      state.vault = unlocked.vault;
-      state.record.lastSyncedAt = new Date().toISOString();
-      await persistVault({ dirty: false });
-      state.pendingRemote = null;
-      state.modal = null;
-      render();
-      resetLockTimer();
-      startSyncSession();
-      toast('已从远端拉取，保险库保持解锁');
-      return;
-    }
-    if (form.dataset.form === 'add-entry' || form.dataset.form === 'edit-entry') {
-      const now = new Date().toISOString();
-      const entry = { title: values.get('title').trim(), username: values.get('username').trim(), password: values.get('password'), category: values.get('category'), url: values.get('url').trim(), notes: values.get('notes').trim(), favorite: values.get('favorite') === 'on', updatedAt: now };
-      if (!entry.title || !entry.username || !entry.password) throw new Error('请填写站点、账户和密码');
-      if (form.dataset.form === 'edit-entry') {
-        const index = state.vault.entries.findIndex((item) => item.id === state.modal.entry.id);
-        if (index < 0 || !sameValue(state.vault.entries[index], state.modal.entry)) throw new Error('此条目已在后台更新或删除，请关闭编辑窗口后重新打开');
-        state.vault.entries[index] = { ...state.vault.entries[index], ...entry };
-      } else {
-        state.vault.entries.unshift({ ...entry, id: makeId(), createdAt: now });
-      }
-      await persistVault();
-      clearTimeout(state.draftTimer);
-      state.formDraft = null;
-      state.savedDraft = null;
-      await queueStorage(() => clearEncryptedDraft());
-      state.modal = null;
-      render();
-      toast('已保存到密码库');
-      return;
-    }
-    if (form.dataset.form === 'sync-config') {
-      const previous = state.vault.sync;
-      const next = { ...syncConfigFromForm(form), automatic: previous.automatic !== false };
-      if (!syncConfigured(next)) throw new Error('请完整填写仓库、分支、路径与令牌');
-      const targetChanged = ['owner', 'repo', 'branch', 'path'].some((key) => previous[key] !== next[key]);
-      stopSyncSession();
-      state.vault.sync = next;
-      if (targetChanged) {
-        state.record.remoteSha = null;
-        delete state.record.syncBase;
-        delete state.record.syncKeyBase;
-        delete state.record.lastSyncedAt;
-      }
-      await persistVault();
-      state.modal = { type: 'sync' };
-      render();
-      startSyncSession();
-      toast('配置已加密保存，请完成首次连接');
-      return;
-    }
-    if (form.dataset.form === 'change-password') {
-      const session = state.session;
-      const record = state.record;
-      const rawVaultKey = state.rawVaultKey;
-      const originalWrapping = { masterSalt: record.masterSalt, wrappedVaultKey: structuredClone(record.wrappedVaultKey) };
-      if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
-      const currentKey = await deriveKey(values.get('currentPassword'), state.record.masterSalt);
-      await decryptText(state.record.wrappedVaultKey, currentKey);
-      const newSalt = randomBase64(16);
-      const newKey = await deriveKey(values.get('newPassword'), newSalt);
-      const wrappedVaultKey = await encryptText(rawVaultKey, newKey);
-      assertSyncSession(session);
-      if (record !== state.record) return;
-      if (!sameValue(originalWrapping, { masterSalt: record.masterSalt, wrappedVaultKey: record.wrappedVaultKey })) throw new Error('主密码已在后台更新，请关闭窗口后重新验证');
-      state.record.masterSalt = newSalt;
-      state.record.wrappedVaultKey = wrappedVaultKey;
-      await persistVault();
-      state.modal = null;
-      render();
-      toast('主密码已更新');
-      return;
-    }
-    if (form.dataset.form === 'recovery-reset') {
-      await acquireVaultLock();
-      await storageQueue;
-      state.record = await dbGet();
-      const session = state.session;
-      const record = state.record;
-      if (values.get('newPassword') !== values.get('confirmPassword')) throw new Error('两次新密码不一致');
-      const { rawVaultKey } = await unlockWithRecovery(record, values.get('recoveryCode'));
-      const masterSalt = randomBase64(16);
-      const masterKey = await deriveKey(values.get('newPassword'), masterSalt);
-      const wrappedVaultKey = await encryptText(rawVaultKey, masterKey);
-      if (session !== state.session || record !== state.record) return;
-      const next = { ...record, masterSalt, wrappedVaultKey, updatedAt: new Date().toISOString(), dirty: true };
-      await queueStorage(() => dbPut(next));
-      state.record = next;
-      releaseVaultLock();
-      state.modal = null;
-      render();
-      toast('主密码已重设');
-    }
-  } catch (error) {
-    if (!state.vaultKey) releaseVaultLock();
-    const friendlyError = form.dataset.form === 'unlock' && error.name === 'OperationError'
-      ? '主密码错误，无法解锁保险库'
-      : form.dataset.form === 'recovery-reset' && error.name === 'OperationError'
-        ? '恢复密钥无效，无法重设主密码'
-        : form.dataset.form === 'remote-unlock' && error.name === 'OperationError'
-          ? '远端主密码错误，无法完成拉取'
-        : form.dataset.form === 'backup-unlock' && error.name === 'OperationError'
-          ? '备份主密码错误或密文已损坏，原保险库已保留'
-          : form.dataset.form === 'change-password' && error.name === 'OperationError'
-            ? '当前主密码错误，请重新输入'
-            : (error.message || '操作失败');
-    const mismatch = /两次/.test(friendlyError);
-    showFormError(form, friendlyError, mismatch ? 'confirmPassword' : form.dataset.form === 'change-password' ? 'currentPassword' : form.dataset.form === 'recovery-reset' ? 'recoveryCode' : undefined);
-  } finally {
-    delete form.dataset.submitting;
-    if (submitButton) submitButton.disabled = false;
-  }
 }
 
 function captureEntryDraft() {
@@ -1342,9 +1802,25 @@ function persistEntryDraft() {
 async function closeModal() {
     clearTimeout(state.revealTimer);
     state.revealTimer = null;
+    if (state.modal?.type === 'confirm') { settleModal(false); return; }
+    if (state.modal?.type === 'prompt') { settleModal(null); return; }
+    if (state.modal?.type === 'message') { state.modal = null; render(); return; }
     const form = app.querySelector('form[data-form="add-entry"], form[data-form="edit-entry"]');
     if (form) {
-        if ((state.formDraft || JSON.stringify(formValues(form)) !== initialFormValues.get(form)) && !confirm('放弃这次未保存的编辑？')) return;
+        const changed = state.formDraft || JSON.stringify(formValues(form)) !== initialFormValues.get(form);
+        if (changed) {
+            // Keep the typed values in the modal we return to if the person
+            // chooses to keep editing.
+            captureEntryDraft();
+            if (state.formDraft) state.modal.draft = state.formDraft;
+            const discard = await askConfirm({
+                title: '放弃编辑',
+                message: '放弃这次未保存的编辑？',
+                confirmLabel: '放弃编辑',
+                danger: true,
+            });
+            if (!discard) return;
+        }
         clearTimeout(state.draftTimer);
         state.formDraft = null;
         state.savedDraft = null;
@@ -1352,6 +1828,38 @@ async function closeModal() {
     }
     if (state.modal?.type === 'remote-unlock') state.pendingRemote = null;
     state.modal = null;
+    render();
+}
+
+function settleModal(value, { restore = true } = {}) {
+    const modal = state.modal;
+    const resolve = modal?.resolve;
+    if (typeof resolve !== 'function') return;
+    state.modal = restore && !value && modal.previousModal ? modal.previousModal : null;
+    resolve(value);
+    render();
+}
+
+function askConfirm({ title, message, confirmLabel = '继续', cancelLabel = '取消', danger = false }) {
+    return new Promise((resolve) => {
+        const previousModal = state.modal?.type === 'confirm' || state.modal?.type === 'prompt'
+            ? state.modal.previousModal : state.modal;
+        state.modal = { type: 'confirm', title, message, confirmLabel, cancelLabel, danger, previousModal, resolve };
+        render();
+    });
+}
+
+function askPrompt({ title, message = '', label = '名称', value = '', placeholder = '', confirmLabel = '保存' }) {
+    return new Promise((resolve) => {
+        const previousModal = state.modal?.type === 'confirm' || state.modal?.type === 'prompt'
+            ? state.modal.previousModal : state.modal;
+        state.modal = { type: 'prompt', title, message, label, value, placeholder, confirmLabel, previousModal, resolve };
+        render();
+    });
+}
+
+function showMessage({ title, message, confirmLabel = '知道了' }) {
+    state.modal = { type: 'message', title, message, confirmLabel };
     render();
 }
 
@@ -1417,162 +1925,256 @@ async function setupServiceWorker() {
 }
 
 function pruneTrash() {
-  const cutoff = Date.now() - 30 * 86400000;
-  const originalLength = state.vault.trash.length;
-  // Keep entries without a valid timestamp: imported or legacy records may not
-  // have one, and an accidental permanent deletion cannot be undone.
-  state.vault.trash = state.vault.trash.filter((entry) => {
-    const deletedAt = Date.parse(entry.deletedAt);
-    return !Number.isFinite(deletedAt) || deletedAt > cutoff;
-  });
-  if (state.vault.trash.length !== originalLength) persistVault().catch(() => {});
+    const cutoff = Date.now() - 30 * 86400000;
+    const originalLength = state.vault.trash.length;
+    // Keep entries without a valid timestamp: imported or legacy records may not
+    // have one, and an accidental permanent deletion cannot be undone.
+    state.vault.trash = state.vault.trash.filter((entry) => {
+        const deletedAt = Date.parse(entry.deletedAt);
+        return !Number.isFinite(deletedAt) || deletedAt > cutoff;
+    });
+    if (state.vault.trash.length !== originalLength) persistVault().catch(() => { });
 }
 
 async function handleAction(event) {
-  const control = event.target.closest('[data-action]');
-  if (!control) return;
-  const action = control.dataset.action;
-  if (action.startsWith('open-') || action === 'import-backup') dialogTrigger = { action: action === 'open-edit' ? 'open-detail' : action, id: control.dataset.id, panel: control.dataset.panel };
-  if (action === 'finish-setup') return; // The recovery-confirm form owns verification.
-  if (action === 'extend-session') { resetLockTimer(); return; }
-  if (action === 'clear-filters') { state.search = ''; state.category = ''; state.favoriteOnly = false; render(); return; }
-  if (action === 'wizard-next' || action === 'wizard-back') {
-    const form = control.closest('form');
-    try { state.modal.configDraft = syncConfigFromForm(form); state.modal.step = action === 'wizard-next' ? 2 : 1; render(); }
-    catch (error) { showFormError(form, error.message, 'repositoryUrl'); }
-    return;
-  }
-  if (action === 'test-sync-connection') { await testSyncConnection(control.closest('form')); return; }
-  if (action === 'generate-password') {
-    const form = control.closest('form');
-    form.elements.password.value = generatePassword(form.querySelector('[data-generator-length]').value);
-    captureEntryDraft();
-    await persistEntryDraft();
-    toast('已生成随机密码，可保存或复制');
-    return;
-  }
-  if (action === 'copy-generated') { await copyText(control.closest('form').elements.password.value); return; }
-  if (action === 'copy-account') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.username, '账户已复制', { clearAfter: 0 }); return; }
-  if (action === 'open-conflicts') { if (!state.syncConflict) return toast('当前没有待处理的冲突'); state.modal = { type: 'conflicts' }; render(); return; }
-  if (action === 'reveal-conflict') {
-    const conflict = state.syncConflict?.conflicts[Number(control.dataset.index)];
-    if (!conflict) return;
-    const node = app.querySelector(`[data-conflict-secret="${Number(control.dataset.index)}"]`);
-    node.hidden = !node.hidden;
-    const password = (value) => typeof value === 'object' && value ? value.entry?.password : value;
-    node.textContent = node.hidden ? '' : `本地：${String(password(conflict.local) ?? '已删除')}\n远端：${String(password(conflict.remote) ?? '已删除')}`;
-    control.textContent = node.hidden ? '查看密码差异' : '隐藏密码差异';
-    return;
-  }
-  if (action === 'resume-draft') {
-    const draft = state.savedDraft;
-    if (!draft) return;
-    state.formDraft = draft;
-    state.modal = draft.type === 'edit-entry' ? { type: 'edit', entry: draft.entry || state.vault.entries.find((entry) => entry.id === draft.entryId), draft } : { type: 'add', draft };
-    if (state.modal.type === 'edit' && !state.modal.entry) { state.modal = null; return toast('此条目已删除，请先导出草稿内容或重新添加'); }
-    render();
-    return;
-  }
-  if (action === 'discard-draft') {
-    if (!confirm('放弃这份未完成的编辑？')) return;
-    state.formDraft = null; state.savedDraft = null;
-    await queueStorage(() => clearEncryptedDraft());
-    render(); return;
-  }
-  if (action === 'restore-previous') { if (!await getRollbackRecord()) return toast('此设备没有可回滚的保险库'); state.modal = { type: 'backup-unlock', rollback: true }; render(); return; }
-  if (action === 'request-storage-persist') {
-    if (typeof navigator.storage?.persist !== 'function') return toast('此浏览器不支持持久化存储申请');
-    const granted = await requestStoragePersistence();
-    await refreshStorageStatus();
-    toast(granted ? '已启用持久化存储' : '浏览器未授予持久化存储，请定期导出加密备份');
-    return;
-  }
-  if (action === 'check-update') {
-    if (!state.serviceWorkerRegistration) return toast('此浏览器不支持应用更新检查');
-    try { await state.serviceWorkerRegistration.update(); }
-    catch { return toast('无法检查更新，请检查网络连接'); }
-    if (state.updateReady) toast('新版本已准备好');
-    else if (state.serviceWorkerRegistration.installing) toast('正在下载新版本，完成后会提示');
-    else toast('已检查应用更新');
-    return;
-  }
-  if (action === 'apply-update') {
-    const worker = state.serviceWorkerRegistration?.waiting;
-    if (!worker) return toast('当前没有等待安装的更新');
-    captureEntryDraft();
-    await persistEntryDraft();
-    await storageQueue;
-    updateRequested = true;
-    lockVault();
-    worker.postMessage({ type: 'SKIP_WAITING' });
-    return;
-  }
-  if (action === 'toggle-password') {
-    const input = control.closest('.password-field').querySelector('input');
-    input.type = input.type === 'password' ? 'text' : 'password';
-    control.setAttribute('aria-label', input.type === 'password' ? '显示密码' : '隐藏密码');
-    control.innerHTML = icon(input.type === 'password' ? 'eye' : 'eye-off');
-    drawIcons();
-    return;
-  }
-  if (action === 'copy-recovery') { await copyText(control.dataset.code, '恢复密钥已复制；2 分钟后尝试清除', { clearAfter: 120000 }); return; }
-  if (action === 'open-recovery-reset') { state.modal = { type: 'recovery-reset' }; render(); return; }
-  if (action === 'view') { state.view = control.dataset.viewName; state.settingsDetail = false; state.drawerOpen = false; render(); return; }
-  if (action === 'mobile-left') { dialogTrigger = { action: 'mobile-left' }; if (state.settingsDetail) { state.settingsDetail = false; render(); } else { state.drawerOpen = true; render(); } return; }
-  if (action === 'close-drawer') { state.drawerOpen = false; render(); return; }
-  if (action === 'setting-panel') { state.settingPanel = control.dataset.panel; if (window.matchMedia('(max-width: 899px)').matches) state.settingsDetail = true; if (state.settingPanel === 'security') void refreshStorageStatus(); render(); return; }
-  if (action === 'set-mode') { document.documentElement.dataset.mode = control.dataset.mode; writePreference('passwmana-mode', control.dataset.mode); applyThemeColor(); render(); return; }
-  if (action === 'set-accent') { document.documentElement.dataset.accent = control.dataset.accent; writePreference('passwmana-accent', control.dataset.accent); render(); return; }
-  if (action === 'toggle-favorite-filter') {
-    state.favoriteOnly = !state.favoriteOnly;
-    control.classList.toggle('active', state.favoriteOnly);
-    control.setAttribute('aria-pressed', String(state.favoriteOnly));
-    const label = control.querySelector('[data-favorite-label]');
-    if (label) label.textContent = state.favoriteOnly ? '显示全部条目' : '仅看收藏';
-    updateVaultList();
-    return;
-  }
-  if (action === 'open-category-filter') { state.modal = { type: 'category-filter' }; render(); return; }
-  if (action === 'select-category') { state.category = control.dataset.category; state.modal = null; render(); return; }
-  if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
-  if (action === 'open-detail') { state.modal = { type: 'detail', id: control.dataset.id, revealed: false }; render(); return; }
-  if (action === 'close-modal') { await closeModal(); return; }
-  if (action === 'reveal-password') {
-    const entry = state.vault.entries.find((item) => item.id === state.modal.id);
-    if (!entry) return;
-    state.modal.revealed = !state.modal.revealed;
-    app.querySelector('[data-secret-value]').textContent = state.modal.revealed ? entry.password : '••••••••••••••••';
-    control.setAttribute('aria-label', state.modal.revealed ? '隐藏密码' : '显示密码');
-    control.setAttribute('aria-pressed', String(state.modal.revealed));
-    control.innerHTML = icon(state.modal.revealed ? 'eye-off' : 'eye');
-    if (state.modal.revealed) scheduleRevealHide();
-    else { clearTimeout(state.revealTimer); state.revealTimer = null; }
-    drawIcons();
-    return;
-  }
-  if (action === 'copy-password') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.password); return; }
-  if (action === 'open-edit') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (!entry) return; state.modal = { type: 'edit', entry: structuredClone(entry) }; render(); return; }
-  if (action === 'delete-entry') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (!confirm(`将“${entry.title}”移至回收站？`)) return; state.vault.entries = state.vault.entries.filter((item) => item.id !== entry.id); state.vault.trash.unshift({ ...entry, deletedAt: new Date().toISOString() }); await persistVault(); state.modal = null; render(); toast('已移至回收站'); return; }
-  if (action === 'restore-entry') { const entry = state.vault.trash.find((item) => item.id === control.dataset.id); state.vault.trash = state.vault.trash.filter((item) => item.id !== entry.id); delete entry.deletedAt; entry.updatedAt = new Date().toISOString(); state.vault.entries.unshift(entry); await persistVault(); render(); toast('已恢复条目'); return; }
-  if (action === 'purge-entry') { if (!confirm('永久删除后无法恢复。是否继续？')) return; state.vault.trash = state.vault.trash.filter((item) => item.id !== control.dataset.id); await persistVault(); render(); toast('已永久删除'); return; }
-  if (action === 'add-category') { const category = prompt('分类名称'); if (!category?.trim()) return; if (state.vault.categories.includes(category.trim())) return toast('分类已存在'); state.vault.categories.push(category.trim()); await persistVault(); render(); return; }
-  if (action === 'delete-category') { const category = control.dataset.category; if (DEFAULT_CATEGORIES.includes(category)) return toast('默认分类不可删除'); if (state.vault.entries.some((entry) => entry.category === category)) return toast('该分类仍有条目，无法删除'); state.vault.categories = state.vault.categories.filter((item) => item !== category); await persistVault(); render(); return; }
-  if (action === 'open-sync') { state.modal = { type: 'sync' }; render(); return; }
-  if (action === 'open-sync-config') { state.modal = { type: 'sync-config' }; render(); return; }
-  if (action === 'toggle-auto-sync') { state.vault.sync.automatic = state.vault.sync.automatic === false; stopSyncSession(); await persistVault(); startSyncSession(); render(); return; }
-  if (action === 'pull-remote') { await pullRemote(); return; }
-  if (action === 'push-remote') { await pushRemote(); return; }
-  if (action === 'export-backup') { await downloadBackup(); return; }
-  if (action === 'import-backup') { await importBackup(); return; }
-  if (action === 'import-legacy') { await importLegacyBackup(); return; }
-  if (action === 'open-change-password') { state.modal = { type: 'change-password' }; render(); return; }
-  if (action === 'lock') { lockVault(); return; }
+    const control = event.target.closest('[data-action]');
+    if (!control) return;
+    const action = control.dataset.action;
+    if (action.startsWith('open-') || action === 'import-backup') dialogTrigger = { action: action === 'open-edit' ? 'open-detail' : action, id: control.dataset.id, panel: control.dataset.panel };
+    if (action === 'finish-setup') return; // The recovery-confirm form owns verification.
+    // The unlock form has two submits; the device one is routed through the
+    // remember checkbox, which selects the sealed-key path in the submit handler.
+    if (control.dataset.submitAs) {
+        const form = control.closest('form');
+        form.querySelector('input[name="keepDeviceUnlock"]').checked = true;
+        form.requestSubmit();
+        return;
+    }
+    if (action === 'extend-session') { resetLockTimer(); return; }
+    if (action === 'clear-filters') { state.search = ''; state.category = ''; state.favoriteOnly = false; render(); return; }
+    if (action === 'wizard-next' || action === 'wizard-back') {
+        const form = control.closest('form');
+        try { state.modal.configDraft = syncConfigFromForm(form); state.modal.step = action === 'wizard-next' ? 2 : 1; render(); }
+        catch (error) { showFormError(form, error.message, 'repositoryUrl'); }
+        return;
+    }
+    if (action === 'test-sync-connection') { await testSyncConnection(control.closest('form')); return; }
+    if (action === 'copy-account') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.username, '账户已复制', { clearAfter: 0 }); return; }
+    if (action === 'copy-url') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry?.url) await copyText(entry.url, '网址已复制', { clearAfter: 0 }); return; }
+    if (action === 'open-conflicts') { if (!state.syncConflict) return toast('当前没有待处理的冲突'); state.modal = { type: 'conflicts' }; render(); return; }
+    if (action === 'reveal-conflict') {
+        const conflict = state.syncConflict?.conflicts[Number(control.dataset.index)];
+        if (!conflict) return;
+        const node = app.querySelector(`[data-conflict-secret="${Number(control.dataset.index)}"]`);
+        node.hidden = !node.hidden;
+        const password = (value) => typeof value === 'object' && value ? value.entry?.password : value;
+        node.textContent = node.hidden ? '' : `本地：${String(password(conflict.local) ?? '已删除')}\n远端：${String(password(conflict.remote) ?? '已删除')}`;
+        control.textContent = node.hidden ? '查看密码差异' : '隐藏密码差异';
+        return;
+    }
+    if (action === 'resume-draft') {
+        const draft = state.savedDraft;
+        if (!draft) return;
+        state.formDraft = draft;
+        state.modal = draft.type === 'edit-entry' ? { type: 'edit', entry: draft.entry || state.vault.entries.find((entry) => entry.id === draft.entryId), draft } : { type: 'add', draft };
+        if (state.modal.type === 'edit' && !state.modal.entry) { state.modal = null; return toast('此条目已删除，请先导出草稿内容或重新添加'); }
+        render();
+        return;
+    }
+    if (action === 'discard-draft') {
+        if (!await askConfirm({ title: '放弃草稿', message: '放弃这份未完成的编辑？', confirmLabel: '放弃草稿', danger: true })) return;
+        state.formDraft = null; state.savedDraft = null;
+        await queueStorage(() => clearEncryptedDraft());
+        render(); return;
+    }
+    if (action === 'restore-previous') { if (!await getRollbackRecord()) return toast('此设备没有可回滚的保险库'); state.modal = { type: 'backup-unlock', rollback: true }; render(); return; }
+    if (action === 'request-storage-persist') {
+        if (typeof navigator.storage?.persist !== 'function') return toast('此浏览器不支持持久化存储申请');
+        const granted = await requestStoragePersistence();
+        await refreshStorageStatus();
+        toast(granted ? '已启用持久化存储' : '浏览器未授予持久化存储，请定期导出加密备份');
+        return;
+    }
+    if (action === 'check-update') {
+        if (!state.serviceWorkerRegistration) return toast('此浏览器不支持应用更新检查');
+        try { await state.serviceWorkerRegistration.update(); }
+        catch { return toast('无法检查更新，请检查网络连接'); }
+        if (state.updateReady) toast('新版本已准备好');
+        else if (state.serviceWorkerRegistration.installing) toast('正在下载新版本，完成后会提示');
+        else toast('已检查应用更新');
+        return;
+    }
+    if (action === 'apply-update') {
+        const worker = state.serviceWorkerRegistration?.waiting;
+        if (!worker) return toast('当前没有等待安装的更新');
+        captureEntryDraft();
+        await persistEntryDraft();
+        await storageQueue;
+        updateRequested = true;
+        lockVault();
+        worker.postMessage({ type: 'SKIP_WAITING' });
+        return;
+    }
+    if (action === 'toggle-password') {
+        const input = control.closest('.password-field').querySelector('input');
+        input.type = input.type === 'password' ? 'text' : 'password';
+        control.setAttribute('aria-label', input.type === 'password' ? '显示密码' : '隐藏密码');
+        control.innerHTML = icon(input.type === 'password' ? 'eye' : 'eye-off');
+        drawIcons();
+        return;
+    }
+    if (action === 'copy-recovery') { await copyText(control.dataset.code, '恢复密钥已复制；2 分钟后尝试清除', { clearAfter: 120000 }); return; }
+    if (action === 'open-recovery-reset') { state.modal = { type: 'recovery-reset' }; render(); return; }
+    if (action === 'view') {
+        state.view = control.dataset.viewName;
+        if (state.view === 'vault') { state.category = ''; state.favoriteOnly = false; }
+        state.settingsDetail = false;
+        state.drawerOpen = false;
+        render();
+        return;
+    }
+    if (action === 'nav-favorites') {
+        state.view = 'vault';
+        state.favoriteOnly = true;
+        state.category = '';
+        state.settingsDetail = false;
+        state.drawerOpen = false;
+        render();
+        return;
+    }
+    if (action === 'nav-category') {
+        state.view = 'vault';
+        state.favoriteOnly = false;
+        state.category = control.dataset.category || '';
+        state.settingsDetail = false;
+        state.drawerOpen = false;
+        render();
+        return;
+    }
+    if (action === 'nav-trash') {
+        state.view = 'settings';
+        state.settingPanel = 'trash';
+        state.settingsDetail = isMobileViewport();
+        state.drawerOpen = false;
+        render();
+        return;
+    }
+    if (action === 'mobile-left') { dialogTrigger = { action: 'mobile-left' }; if (state.settingsDetail) { state.settingsDetail = false; render(); } else { state.drawerOpen = true; render(); } return; }
+    if (action === 'close-drawer') { state.drawerOpen = false; render(); return; }
+    if (action === 'setting-panel') { state.settingPanel = control.dataset.panel; if (isMobileViewport()) state.settingsDetail = true; if (state.settingPanel === 'security') void refreshStorageStatus(); render(); return; }
+    if (action === 'set-mode') { document.documentElement.dataset.mode = control.dataset.mode; writePreference('passwmana-mode', control.dataset.mode); applyThemeColor(); render(); return; }
+    if (action === 'set-accent') { document.documentElement.dataset.accent = control.dataset.accent; writePreference('passwmana-accent', control.dataset.accent); render(); return; }
+    if (action === 'quick-select') {
+        const entry = state.vault.entries.find((item) => item.id === control.dataset.id);
+        if (entry) await activateQuickSwitch(entry);
+        return;
+    }
+    if (action === 'open-add') { state.modal = { type: 'add' }; render(); return; }
+    if (action === 'open-detail') {
+        state.selectedId = control.dataset.id;
+        state.inspectorRevealed = false;
+        clearTimeout(state.revealTimer);
+        state.revealTimer = null;
+        if (isMobileViewport()) {
+            state.modal = { type: 'detail', id: control.dataset.id, revealed: false };
+            render();
+        } else {
+            updateVaultSelection();
+        }
+        return;
+    }
+    if (action === 'toggle-favorite') {
+        const entry = state.vault.entries.find((item) => item.id === control.dataset.id);
+        if (!entry) return;
+        entry.favorite = !entry.favorite;
+        await persistVault();
+        updateVaultList();
+        syncFavoriteControls(entry);
+        animateFavorite(entry.id);
+        const target = [...app.querySelectorAll('[data-action="toggle-favorite"]')].find((node) => node.dataset.id === entry.id && node.getClientRects().length);
+        target?.focus();
+        toast(entry.favorite ? '已加入收藏' : '已取消收藏');
+        return;
+    }
+    if (action === 'close-modal') { await closeModal(); return; }
+    if (action === 'reveal-password') {
+        const inModal = state.modal?.type === 'detail';
+        const targetId = inModal ? state.modal.id : (control.dataset.id || state.selectedId);
+        const entry = state.vault.entries.find((item) => item.id === targetId);
+        if (!entry) return;
+        const revealed = inModal ? (state.modal.revealed = !state.modal.revealed) : (state.inspectorRevealed = !state.inspectorRevealed);
+        const secret = app.querySelector('[data-secret-value]');
+        if (secret) {
+            secret.innerHTML = revealed ? formatPasswordHtml(entry.password) : '••••••••••••••••';
+            secret.classList.toggle('revealed', revealed);
+            secret.classList.toggle('masked', !revealed);
+        }
+        control.setAttribute('aria-label', revealed ? '隐藏密码' : '显示密码');
+        control.setAttribute('title', revealed ? '隐藏密码' : '显示密码');
+        control.setAttribute('aria-pressed', String(revealed));
+        control.innerHTML = icon(revealed ? 'eye-off' : 'eye');
+        if (revealed) scheduleRevealHide();
+        else { clearTimeout(state.revealTimer); state.revealTimer = null; }
+        drawIcons(control);
+        return;
+    }
+    if (action === 'copy-password') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (entry) await copyText(entry.password); return; }
+    if (action === 'open-edit') { const entry = state.vault.entries.find((item) => item.id === control.dataset.id); if (!entry) return; state.modal = { type: 'edit', entry: structuredClone(entry) }; render(); return; }
+    if (action === 'delete-entry') {
+        const entry = state.vault.entries.find((item) => item.id === control.dataset.id);
+        if (!entry) return;
+        if (!await askConfirm({ title: '移至回收站', message: `将“${entry.title}”移至回收站？`, confirmLabel: '移至回收站', danger: true })) return;
+        state.vault.entries = state.vault.entries.filter((item) => item.id !== entry.id);
+        state.vault.trash.unshift({ ...entry, deletedAt: new Date().toISOString() });
+        if (state.selectedId === entry.id) {
+            state.selectedId = null;
+            state.inspectorRevealed = false;
+            clearTimeout(state.revealTimer);
+            state.revealTimer = null;
+        }
+        await persistVault(); state.modal = null; render(); toast('已移至回收站'); return;
+    }
+    if (action === 'restore-entry') { const entry = state.vault.trash.find((item) => item.id === control.dataset.id); state.vault.trash = state.vault.trash.filter((item) => item.id !== entry.id); delete entry.deletedAt; entry.updatedAt = new Date().toISOString(); state.vault.entries.unshift(entry); await persistVault(); render(); toast('已恢复条目'); return; }
+    if (action === 'purge-entry') {
+        if (!await askConfirm({ title: '永久删除', message: '永久删除后无法恢复。是否继续？', confirmLabel: '永久删除', danger: true })) return;
+        state.vault.trash = state.vault.trash.filter((item) => item.id !== control.dataset.id);
+        await persistVault(); render(); toast('已永久删除'); return;
+    }
+    if (action === 'add-category') {
+        const category = await askPrompt({ title: '新增分类', label: '分类名称', placeholder: '例如：工作', confirmLabel: '添加分类' });
+        if (!category) return;
+        if (state.vault.categories.includes(category)) return toast('分类已存在');
+        state.vault.categories.push(category);
+        await persistVault(); render(); return;
+    }
+    if (action === 'delete-category') { const category = control.dataset.category; if (DEFAULT_CATEGORIES.includes(category)) return toast('默认分类不可删除'); if (state.vault.entries.some((entry) => entry.category === category)) return toast('该分类仍有条目，无法删除'); state.vault.categories = state.vault.categories.filter((item) => item !== category); await persistVault(); render(); return; }
+    if (action === 'open-sync') { state.modal = { type: 'sync' }; render(); return; }
+    if (action === 'open-sync-config') { state.modal = { type: 'sync-config' }; render(); return; }
+    if (action === 'toggle-auto-sync') { state.vault.sync.automatic = state.vault.sync.automatic === false; stopSyncSession(); await persistVault(); startSyncSession(); render(); return; }
+    if (action === 'pull-remote') { await pullRemote(); return; }
+    if (action === 'push-remote') { await pushRemote(); return; }
+    if (action === 'export-backup') { await downloadBackup(); return; }
+    if (action === 'import-backup') { await importBackup(); return; }
+    if (action === 'import-legacy') { await importLegacyBackup(); return; }
+    if (action === 'open-change-password') { state.modal = { type: 'change-password' }; render(); return; }
+    if (action === 'open-enable-device-unlock') { state.modal = { type: 'enable-device-unlock' }; render(); return; }
+    if (action === 'open-disable-device-unlock') { state.modal = { type: 'disable-device-unlock' }; render(); return; }
+    if (action === 'dismiss-resume-notice') { state.resumedByDevice = false; render(); return; }
+    if (action === 'lock') { lockVault(); return; }
 }
 
-app.addEventListener('click', (event) => { handleAction(event).catch((error) => toast(error.message || '操作失败')); });
+app.addEventListener('click', (event) => { handleAction(event).catch((error) => { toast(error.message || '操作失败'); }); });
 app.addEventListener('submit', handleSubmit);
 app.addEventListener('input', (event) => {
-    if (event.target.dataset.input === 'search') { state.search = event.target.value; updateVaultList(); }
+    if (event.target.dataset.input === 'search') { state.search = event.target.value; scheduleVaultListUpdate(); }
+    if (event.target.name === 'quickQuery' && state.modal?.type === 'quick-switch') {
+        // The input survives the list repaint so the caret and IME composition
+        // keep working while the results underneath change.
+        state.modal.query = event.target.value;
+        state.modal.index = 0;
+        updateQuickSwitch();
+        return;
+    }
     const form = event.target.closest('form');
     if (event.target.name === 'password' || event.target.name === 'newPassword') {
         const help = form?.querySelector('[data-password-strength]');
@@ -1596,15 +2198,132 @@ app.addEventListener('invalid', (event) => {
     showFormError(form, event.target.validity.valueMissing ? '请填写此项' : event.target.validity.tooShort ? '主密码至少需要 12 个字符' : '请检查输入格式', event.target.name);
 }, true);
 app.addEventListener('change', async (event) => {
-  if (event.target.dataset.input === 'category') { state.category = event.target.value; updateVaultList(); }
-  if (event.target.dataset.input === 'lock-minutes') {
-    try { state.vault.preferences.lockMinutes = Number(event.target.value); await persistVault(); resetLockTimer(); toast('自动锁定设置已保存'); }
-    catch (error) { toast(`设置保存失败：${error.message}`); }
-  }
-  if (event.target.closest('form[data-form="add-entry"], form[data-form="edit-entry"]')) { captureEntryDraft(); void persistEntryDraft().catch(() => {}); }
+    if (event.target.dataset.input === 'sort') {
+        state.sort = Object.hasOwn(SORT_LABELS, event.target.value) ? event.target.value : 'updated';
+        writePreference('passwmana-sort', state.sort);
+        updateVaultList();
+        return;
+    }
+    if (event.target.dataset.input === 'lock-minutes') {
+        try { state.vault.preferences.lockMinutes = Number(event.target.value); await persistVault(); resetLockTimer(); toast('自动锁定设置已保存'); }
+        catch (error) { toast(`设置保存失败：${error.message}`); }
+    }
+    if (event.target.closest('form[data-form="add-entry"], form[data-form="edit-entry"]')) { captureEntryDraft(); void persistEntryDraft().catch(() => { }); }
 });
 
+// Focus the search box of whichever screen is showing. Re-rendering the vault
+// for a shortcut would throw away an open filter, category or scroll position.
+function focusSearchField() {
+    if (state.vaultKey && state.view === 'vault' && !app.querySelector('[data-input="search"]')) render();
+    const field = app.querySelector('[data-input="search"]');
+    if (!field) return false;
+    field.focus();
+    field.select?.();
+    return true;
+}
+
+// ── quick switch ──────────────────────────────────────────────────────────
+// A password manager is used in five-second bursts. The palette turns the whole
+// flow into one keystroke: open, type two letters, arrow, Enter copies the
+// password and opens the site.
+function openQuickSwitch() {
+    const previousModal = state.modal;
+    state.modal = { type: 'quick-switch', query: '', index: 0, previousModal };
+    render();
+}
+
+function closeQuickSwitch() {
+    state.modal = state.modal?.previousModal || null;
+    render();
+}
+
+// Entries matching the palette query; the first one is preselected so Enter
+// works before a query is typed.
+function quickSwitchMatches() {
+    const query = (state.modal?.query || '').trim().toLocaleLowerCase();
+    const entries = [...state.vault.entries].sort((left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite))
+        || (Date.parse(right.updatedAt) || 0) - (Date.parse(left.updatedAt) || 0));
+    return query ? entries.filter((entry) => searchableEntryText(entry).includes(query)) : entries;
+}
+
+function quickSwitchListTemplate() {
+    const matches = quickSwitchMatches();
+    if (!matches.length) return `<div class="empty-state">${icon('search')}<div>没有找到匹配的条目</div></div>`;
+    const index = Math.min(state.modal?.index || 0, matches.length - 1);
+    // Eight rows keeps the palette on one screen; the rest is a query away.
+    return matches.slice(0, 8).map((entry, position) => `<button type="button" class="quick-row ${position === index ? 'active' : ''}" data-action="quick-select" data-id="${escapeHtml(entry.id)}" aria-selected="${position === index}"><span class="monogram" data-tab="${identityTab(entry)}">${escapeHtml(monogramOf(entry))}</span><span class="quick-copy"><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(entry.username || '未设置账户')}</span></span>${entry.favorite ? icon('star', 'starred') : ''}${icon('copy')}</button>`).join('');
+}
+
+// Copy the password, close the palette and, when the entry has a website, open
+// it in a new tab so the paste lands where the login form is.
+function activateQuickSwitch(entry) {
+    if (!entry) return;
+    const url = safeWebUrl(entry.url);
+    // Copy before closing: the palette owns focus, and a rejected clipboard
+    // permission should report through the palette's toast instead of a blank screen.
+    return copyText(entry.password, url ? '密码已复制；正在打开网站' : '密码已复制')
+        .then(() => {
+            state.modal = null;
+            render();
+            if (url) window.open(url, '_blank', 'noopener');
+        });
+}
+
+// Repaint only the list so the query field keeps its caret and IME composition.
+function updateQuickSwitch() {
+    if (state.modal?.type !== 'quick-switch') return;
+    const list = app.querySelector('[data-quick-list]');
+    if (!list) return;
+    list.innerHTML = quickSwitchListTemplate();
+    drawIcons(list);
+}
+
+// The search box is one keystroke away, but only from a screen that has no text
+// field of its own, so typing a slash inside another form keeps its meaning.
+function isTypingTarget(target) {
+    if (!target) return false;
+    const tag = target.tagName;
+    return target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
 document.addEventListener('keydown', (event) => {
+    const command = event.ctrlKey || event.metaKey;
+    if (command && !event.altKey && event.key.toLowerCase() === 'k') {
+        // In an input the browser's own address-bar search applies (Ctrl+K), which
+        // is what someone typing a URL there expects; only a bare screen owns it.
+        if (!state.vaultKey || isTypingTarget(event.target)) return;
+        event.preventDefault();
+        if (state.modal?.type === 'quick-switch') closeQuickSwitch();
+        else openQuickSwitch();
+        return;
+    }
+    if (command && event.shiftKey && event.key.toLowerCase() === 'l') {
+        // Chrome and Edge reserve the plain shortcut for the address bar, so the
+        // page only ever sees it with Shift.
+        if (state.vaultKey) { event.preventDefault(); lockVault(); }
+        return;
+    }
+    if (state.modal?.type === 'quick-switch') {
+        if (event.key === 'Escape') { event.preventDefault(); closeQuickSwitch(); return; }
+        const matches = quickSwitchMatches();
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            if (!matches.length) return;
+            const step = event.key === 'ArrowDown' ? 1 : -1;
+            state.modal.index = (state.modal.index + step + matches.length) % matches.length;
+            updateQuickSwitch();
+            return;
+        }
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            void activateQuickSwitch(matches[state.modal.index]);
+            return;
+        }
+    }
+    if (event.key === '/' && state.vaultKey && !state.modal && !isTypingTarget(event.target)) {
+        if (focusSearchField()) event.preventDefault();
+        return;
+    }
     if (event.key === 'Escape' && activeDialog) {
         event.preventDefault();
         if (state.drawerOpen) { state.drawerOpen = false; render(); }
@@ -1613,7 +2332,7 @@ document.addEventListener('keydown', (event) => {
     }
     trapDialogKey(event, activeDialog);
 });
-window.addEventListener('pagehide', () => { captureEntryDraft(); void persistEntryDraft().catch(() => {}); });
+window.addEventListener('pagehide', () => { captureEntryDraft(); void persistEntryDraft().catch(() => { }); });
 window.addEventListener('beforeunload', (event) => {
     const form = app.querySelector('form[data-form="add-entry"], form[data-form="edit-entry"]');
     if (form && JSON.stringify(formValues(form)) !== initialFormValues.get(form) && !updateRequested) { event.preventDefault(); event.returnValue = ''; }
@@ -1622,20 +2341,39 @@ window.addEventListener('beforeunload', (event) => {
 for (const eventName of ['pointerdown', 'keydown', 'touchstart', 'wheel']) document.addEventListener(eventName, resetLockTimer, { passive: true });
 window.addEventListener('online', () => { refreshSyncStatus(); scheduleAutoSync(0); });
 window.addEventListener('offline', refreshSyncStatus);
-window.addEventListener('focus', () => scheduleAutoSync(0));
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleAutoSync(0); });
-window.addEventListener('resize', () => { if (!window.matchMedia('(max-width: 899px)').matches && state.settingsDetail) { state.settingsDetail = false; render(); } });
+window.addEventListener('focus', syncOnForeground);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncOnForeground(); });
+window.addEventListener('resize', () => {
+    if (!isMobileViewport() && (state.settingsDetail || state.modal?.type === 'detail')) {
+        state.settingsDetail = false;
+        if (state.modal?.type === 'detail') {
+            state.selectedId = state.modal.id;
+            state.modal = null;
+        }
+        render();
+    }
+});
 
 async function bootstrap() {
-  document.documentElement.dataset.mode = readPreference('passwmana-mode') || 'system';
-  document.documentElement.dataset.accent = readPreference('passwmana-accent') || 'emerald';
-  applyThemeColor();
-  state.record = await dbGet();
-  render();
-  void setupServiceWorker();
-  // Ask early, before the browser decides this origin is disposable. Browsers
-  // that require a user gesture can still grant it from Settings > Security.
-  void requestStoragePersistence().finally(() => refreshStorageStatus());
+    document.documentElement.dataset.mode = readPreference('passwmana-mode') || 'system';
+    document.documentElement.dataset.accent = readPreference('passwmana-accent') || 'emerald';
+    const savedSort = readPreference('passwmana-sort');
+    state.sort = Object.hasOwn(SORT_LABELS, savedSort || '') ? savedSort : 'updated';
+    applyThemeColor();
+    state.record = await dbGet();
+    state.deviceUnlock = state.record ? await hasDeviceUnlock() : false;
+    // A browser keyword search such as `pm 银行` arrives as `#search=银行`; the term
+    // is already in the address bar, so it needs no clipboard or typing.
+    const term = new URLSearchParams(window.location.hash.slice(1)).get('search');
+    if (term) state.search = term.slice(0, 200);
+    render();
+    void setupServiceWorker();
+    // Ask early, before the browser decides this origin is disposable. Browsers
+    // that require a user gesture can still grant it from Settings > Security.
+    void requestStoragePersistence().finally(() => refreshStorageStatus());
+    // Last, so the fresh render and the resume do not race each other. A pause lets
+    // a person with the vault locked by hand reach the password form first.
+    if (state.record && state.deviceUnlock) setTimeout(() => { void tryAutoResume(); }, 400);
 }
 
 bootstrap().catch((error) => { app.textContent = `无法初始化保险库: ${error.message}`; });

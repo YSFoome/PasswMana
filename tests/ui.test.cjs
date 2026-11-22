@@ -127,22 +127,17 @@ test('an old asynchronous clipboard read cannot clear a newer copy', async () =>
     assert.equal(contents, 'synthetic-password-B');
 });
 
-test('password generation uses rejection sampling rather than modulo-biased bytes', async () => {
-    const { generatePassword } = await helpersPromise;
-    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*-_+';
-    const limit = Math.floor(256 / alphabet.length) * alphabet.length;
-    let calls = 0;
-    const random = (bytes) => {
-        calls += 1;
-        if (calls === 1) bytes.fill(limit);
-        else for (let index = 0; index < bytes.length; index += 1) bytes[index] = index % alphabet.length;
-        return bytes;
-    };
-    assert.equal(generatePassword(20, random), alphabet.slice(0, 20));
-    assert.equal(calls, 2, 'Bytes in the incomplete modulo range must be discarded');
-    assert.equal(generatePassword(1).length, 12);
-    assert.equal(generatePassword(999).length, 64);
-    assert.match(generatePassword(32), /^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*\-_+]{32}$/);
+test('sortEntries pins favorites in the default order and sorts by title or creation date', async () => {
+    const { sortEntries } = await helpersPromise;
+    const entries = [
+        { id: 'a', title: 'Alpha', favorite: true, updatedAt: '2026-01-01T00:00:00Z', createdAt: '2026-01-01T00:00:00Z' },
+        { id: 'b', title: 'Bravo', favorite: false, updatedAt: '2026-01-02T00:00:00Z', createdAt: '2026-01-02T00:00:00Z' },
+        { id: 'c', title: 'Charlie', favorite: false, updatedAt: '2026-01-03T00:00:00Z', createdAt: '2026-01-03T00:00:00Z' },
+    ];
+    assert.deepEqual(sortEntries(entries, 'updated').map((entry) => entry.id), ['a', 'c', 'b']);
+    assert.deepEqual(sortEntries(entries, 'title').map((entry) => entry.id), ['a', 'b', 'c']);
+    assert.deepEqual(sortEntries(entries, 'created').map((entry) => entry.id), ['c', 'b', 'a']);
+    assert.deepEqual(entries.map((entry) => entry.id), ['a', 'b', 'c'], 'sorting must not mutate the vault array');
 });
 
 test('website links allow HTTP(S) and refuse scripts, local files and embedded credentials', async () => {

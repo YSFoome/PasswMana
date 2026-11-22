@@ -5,17 +5,17 @@ export function passwordStrength(password = '') {
     return password.length >= 20 || groups >= 3 ? '长度和字符组合较好；请使用独有的主密码。' : '可以使用；增加长度或使用多个无关词语会更好。';
 }
 
-export function generatePassword(length = 20, random = crypto.getRandomValues.bind(crypto)) {
-    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*-_+';
-    const size = Math.max(12, Math.min(64, Number(length) || 20));
-    const limit = Math.floor(256 / alphabet.length) * alphabet.length;
-    let password = '';
-    while (password.length < size) {
-        for (const byte of random(new Uint8Array(size * 2))) {
-            if (byte < limit && password.length < size) password += alphabet[byte % alphabet.length];
-        }
-    }
-    return password;
+// Default order pins favorites, matching the existing register. Explicit name
+// and creation orders are pure so the chosen key is predictable across the list.
+export function sortEntries(entries, mode = 'updated') {
+    const byTitle = (left, right) => String(left.title || '').localeCompare(String(right.title || ''), 'zh-CN', { sensitivity: 'base', numeric: true });
+    const byTime = (field) => (left, right) => (Date.parse(right[field]) || 0) - (Date.parse(left[field]) || 0);
+    const byUpdated = byTime('updatedAt');
+    const byCreated = byTime('createdAt');
+    const compare = mode === 'title' ? (left, right) => byTitle(left, right) || byUpdated(left, right)
+        : mode === 'created' ? (left, right) => byCreated(left, right) || byTitle(left, right)
+            : (left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite)) || byUpdated(left, right) || byTitle(left, right);
+    return [...entries].sort(compare);
 }
 
 export function safeWebUrl(value) {
@@ -96,7 +96,12 @@ export function enhanceDialogs(root, { drawerOpen = false, trigger = null } = {}
         const heading = dialog.querySelector('h2');
         if (heading) { heading.id ||= 'active-dialog-title'; dialog.setAttribute('aria-labelledby', heading.id); }
         else dialog.setAttribute('aria-label', '导航');
-        (dialog.querySelector('input:not([type="checkbox"]), select, textarea') || dialog.querySelector('button, a[href]'))?.focus();
+        const focusTarget = dialog.querySelector('[data-autofocus]')
+            || dialog.querySelector('input:not([type="checkbox"]), select, textarea')
+            || dialog.querySelector('.modal-foot .primary-button')
+            || dialog.querySelector('.modal-foot .secondary-button')
+            || dialog.querySelector('button, a[href]');
+        focusTarget?.focus();
     } else if (trigger) {
         const controls = [...root.querySelectorAll('[data-action]')];
         const target = controls.find((node) => node.dataset.action === trigger.action

@@ -71,9 +71,6 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
         navigator: { onLine: true },
         localStorage: { getItem() { return null; }, setItem() {} },
         getComputedStyle: () => ({ getPropertyValue: () => '' }),
-        confirm(message) { confirmations.push(message); return true; },
-        alert() {},
-        prompt() { return null; },
         setTimeout(callback, delay = 0) {
             const id = ++timerId;
             timers.set(id, { callback, delay });
@@ -91,9 +88,10 @@ function loadApp(fetchHandler = async () => response(404, {}), { repositoryResul
         },
         __save(record) { saved.push(clone(record)); },
         __notice(message) { notices.push(message); },
+        __confirm(message) { confirmations.push(message); return true; },
     });
     const source = scriptWithModuleMocks(fs.readFileSync(sourcePath, 'utf8').replace(/bootstrap\(\)\.catch\([\s\S]*?\);\s*$/, ''));
-    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaultChanges, resolveSyncConflicts, keyMetadata, encryptText, decryptText: (value, key) => decryptText(JSON.parse(JSON.stringify(value)), key), persistVault, synchronize, pushRemote, pullRemote, lockVault, remoteRequest, convertLegacyBackup, validateVault, ...__testModules['./sync-core.js'], defaultVault: __testModules['./vault-core.js'].defaultVault };`, context, { filename: sourcePath });
+    vm.runInContext(`${source}\nrender = () => {};\ntoast = __notice;\naskConfirm = async ({ message }) => __confirm(message);\naskPrompt = async () => null;\nshowMessage = () => {};\ndbPut = async (record) => __save(record);\nglobalThis.testApi = { state, mergeVaultChanges, resolveSyncConflicts, keyMetadata, encryptText, decryptText: (value, key) => decryptText(JSON.parse(JSON.stringify(value)), key), persistVault, synchronize, pushRemote, pullRemote, lockVault, remoteRequest, convertLegacyBackup, validateVault, ...__testModules['./sync-core.js'], defaultVault: __testModules['./vault-core.js'].defaultVault };`, context, { filename: sourcePath });
     return { api: context.testApi, context, saved, notices, confirmations, requests, timers };
 }
 
@@ -108,6 +106,7 @@ async function initialize(app, local, base = local, { bound = true, dirty = true
         ...passwordMetadata(2),
         encryptedVault: await app.api.encryptText(JSON.stringify(local), key),
         remoteSha: bound ? 'sha-base' : null,
+        remoteEtag: bound ? 'etag-base' : '',
         syncBase: bound ? await app.api.encryptText(JSON.stringify(base), key) : null,
         syncKeyBase: bound ? passwordMetadata(2) : null,
         dirty,
@@ -128,10 +127,66 @@ function contentsRequests(app) {
     return app.requests.filter((request) => request.url.includes('/contents/'));
 }
 
+function remoteFileWithEtag(app, remoteVault, sha = 'sha-remote', key = app.api.state.vaultKey) {
+    return remoteFile(app, remoteVault, sha, key).then((file) => ({
+        ...file,
+        etag: `etag-${sha}`,
+        response: (status = 200) => response(status, { sha: file.sha, content: file.content }, { etag: `etag-${sha}` }),
+    }));
+}
+
 async function pushedVault(app, request) {
     const payload = JSON.parse(atob(request.body.content));
     return JSON.parse(await app.api.decryptText(payload.encryptedVault, app.api.state.vaultKey));
 }
+
+test('an unchanged remote answers If-None-Match with 304 and skips download, decrypt and merge', async () => {
+    const app = loadApp(async (request) => {
+        assert.equal(request.method, 'GET');
+        assert.equal(request.headers['If-None-Match'], 'etag-base');
+        return response(304, {}, { etag: 'etag-base' });
+    });
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base, { dirty: false });
+    const before = JSON.stringify(app.api.state.vault);
+    await app.api.synchronize({ automatic: true });
+    assert.equal(JSON.stringify(app.api.state.vault), before);
+    assert.equal(app.api.state.record.remoteEtag, 'etag-base');
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+    assert.equal(app.api.state.record.dirty, false);
+    assert.ok(app.api.state.record.lastSyncedAt);
+});
+
+test('a 304 while local changes are dirty uploads against the known remote SHA', async () => {
+    let puts = 0;
+    const app = loadApp(async (request) => {
+        if (request.method === 'GET') {
+            assert.equal(request.headers['If-None-Match'], 'etag-base');
+            return response(304, {}, { etag: 'etag-base' });
+        }
+        puts += 1;
+        return response(200, { content: { sha: 'sha-next' } });
+    });
+    await initialize(app, vault({ entries: [entry('a', { notes: 'local edit' })] }), vault({ entries: [entry('a')] }), { dirty: true });
+    await app.api.synchronize();
+    assert.equal(puts, 1);
+    const put = contentsRequests(app).find((request) => request.method === 'PUT');
+    assert.equal(put.body.sha, 'sha-base');
+    assert.equal(app.api.state.record.remoteSha, 'sha-next');
+    assert.equal(app.api.state.record.dirty, false);
+});
+
+test('a successful contents read stores the response ETag for the next poll', async () => {
+    let remote;
+    const app = loadApp(async () => remote.response());
+    const base = vault({ entries: [entry('a')] });
+    await initialize(app, base, base, { dirty: false });
+    remote = await remoteFileWithEtag(app, vault({ entries: [entry('a'), entry('remote')] }), 'sha-remote');
+    await app.api.synchronize({ automatic: true });
+    assert.equal(app.api.state.record.remoteEtag, 'etag-sha-remote');
+    assert.deepEqual(clone(app.api.state.vault.entries.map((item) => item.id).sort()), ['a', 'remote']);
+    assert.equal(contentsRequests(app).filter((request) => request.method === 'PUT').length, 0);
+});
 
 test('a remote file beyond the contents API size limit is read through the blobs endpoint', async () => {
     let remote;

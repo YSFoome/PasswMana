@@ -261,3 +261,54 @@ test('edit draft retains the original entry snapshot and restore clears obsolete
     await core.commitBackupRestore(await core.prepareBackupRestore(fixture.record, { masterPassword: password }));
     assert.equal(await core.loadEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey), null);
 });
+
+test('device unlock resumes the vault key without the master password and withdraws cleanly', async () => {
+    const core = await corePromise;
+    const database = memoryIndexedDb();
+    globalThis.indexedDB = database;
+    await core.dbPut(fixture.record);
+    assert.equal(await core.hasDeviceUnlock(), false);
+    assert.equal(await core.loadDeviceUnlock(fixture.record), null);
+
+    // A fresh authentication writes a new updatedAt, which the seal is bound to.
+    const authenticated = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
+    await core.saveDeviceUnlock(authenticated, fixture.rawVaultKey);
+    assert.equal(await core.hasDeviceUnlock(), true);
+    const stored = database.records().get('device-unlock');
+    const serialized = JSON.stringify(stored);
+    // The key that protects the blob is not extractable and its bytes never land
+    // in storage; the vault key itself only appears as ciphertext.
+    assert.equal(stored.key.extractable, false);
+    assert.ok(!serialized.includes(fixture.rawVaultKey));
+    assert.ok(!serialized.includes('wrappedVaultKey'));
+
+    const resumed = await core.loadDeviceUnlock(authenticated);
+    assert.equal(resumed.rawVaultKey, undefined);
+    assert.deepEqual(resumed.vault, fixture.vault);
+    const raw = await crypto.subtle.exportKey('raw', resumed.vaultKey).catch(() => null);
+    assert.equal(raw, null, 'the imported session key stays non-extractable');
+    const reread = await core.decryptText(authenticated.encryptedVault, resumed.vaultKey);
+    assert.deepEqual(JSON.parse(reread), fixture.vault);
+
+    // A record that moved on since the seal cannot be resumed from it.
+    assert.equal(await core.loadDeviceUnlock({ ...authenticated, updatedAt: '2026-10-10T10:00:00.000Z' }), null);
+    assert.equal(await core.loadDeviceUnlock({ ...authenticated, createdAt: '2026-10-10T00:00:00.000Z' }), null);
+
+    await core.clearDeviceUnlock();
+    assert.equal(await core.hasDeviceUnlock(), false);
+    assert.equal(await core.loadDeviceUnlock(authenticated), null);
+});
+
+test('a damaged or absent device unlock never blocks the password path', async () => {
+    const core = await corePromise;
+    const database = memoryIndexedDb();
+    globalThis.indexedDB = database;
+    const authenticated = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
+    await core.saveDeviceUnlock(authenticated, fixture.rawVaultKey);
+    const stored = database.records().get('device-unlock');
+    stored.encrypted.data = core.randomBase64(32);
+    assert.equal(await core.loadDeviceUnlock(authenticated), null);
+    // The master password still opens the same record.
+    const unlocked = await core.unlockWithMaster(authenticated, password);
+    assert.deepEqual(unlocked.vault, fixture.vault);
+});

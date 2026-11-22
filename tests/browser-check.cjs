@@ -178,19 +178,28 @@ async function lockThroughUi(page) {
     await page.locator('[data-form="unlock"]').waitFor();
 }
 
+async function confirmDialog(page, expected) {
+    const dialog = page.locator('form[data-form="confirm"]');
+    await dialog.waitFor();
+    if (expected) assert.match(await dialog.textContent(), expected);
+    await dialog.locator('[type="submit"]').click();
+    await dialog.waitFor({ state: 'hidden' });
+}
+
 async function uploadFile(page, action, name, buffer) {
     const chooser = page.waitForEvent('filechooser');
     await visibleClick(page, `[data-action="${action}"]`);
     await (await chooser).setFiles({ name, mimeType: 'application/json', buffer });
 }
 
-async function checkKeyboardAndGenerator(page) {
+async function checkKeyboardDialog(page) {
     await visibleClick(page, '[data-action="open-add"]');
     const form = page.locator('[data-form="add-entry"]');
     await form.waitFor();
     assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('name')), 'title');
     assert.equal(await form.getAttribute('role'), 'dialog');
     assert.equal(await form.getAttribute('aria-modal'), 'true');
+    assert.equal(await form.locator('[data-action="generate-password"]').count(), 0, 'Password generator must be removed');
     const controls = form.locator('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)');
     for (let index = 0; index < await controls.count() + 2; index += 1) {
         await page.keyboard.press('Tab');
@@ -206,13 +215,9 @@ async function checkKeyboardAndGenerator(page) {
     assert.equal(await page.evaluate(() => document.activeElement?.dataset.action), 'open-add', 'Closing the modal must return keyboard focus to its trigger');
 
     await visibleClick(page, '[data-action="open-add"]');
-    await form.locator('[data-generator-length]').selectOption('32');
-    await form.locator('[data-action="generate-password"]').click();
-    const generated = await form.locator('[name="password"]').inputValue();
-    assert.equal(generated.length, 32);
-    await form.locator('[data-action="copy-generated"]').click();
-    assert.equal(await page.evaluate(() => globalThis.__syntheticClipboard), generated);
+    await form.locator('[name="password"]').fill('synthetic-unsaved-entry-secret');
     await page.keyboard.press('Escape');
+    await confirmDialog(page, /放弃这次未保存的编辑/);
     await form.waitFor({ state: 'hidden' });
 }
 
@@ -272,7 +277,8 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
     const github = { payload: null, sha: null, version: 0, requests: [], failure: 0, delay: 0 };
     page.on('pageerror', (error) => browserErrors.push(error.message));
     let promptValue = 'Synthetic unused custom category';
-    const observeDialogs = (observedPage) => observedPage.on('dialog', (dialog) => dialog.accept(dialog.type() === 'prompt' ? promptValue : undefined));
+    // Native dialogs are no longer used by the app; any that appear are a bug.
+    const observeDialogs = (observedPage) => observedPage.on('dialog', (dialog) => { browserErrors.push(`native ${dialog.type()} dialog: ${dialog.message()}`); dialog.dismiss(); });
     observeDialogs(page);
     await context.route('**/app.js', async (route) => {
         const source = await fs.promises.readFile(path.join(repositoryRoot, 'app.js'), 'utf8');
@@ -322,10 +328,14 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.locator('[name="recoverySuffix"]').fill(recoveryCode.split('-').at(-1));
         await page.locator('[data-action="finish-setup"]').click();
 
-        await page.getByText('还没有密码条目', { exact: true }).waitFor();
+        await page.getByText('这里还空着', { exact: true }).waitFor();
         await checkSettingsNavigation(page, outputDirectory, mobile, name);
         await setting(page, 'categories', mobile);
         await visibleClick(page, '[data-action="add-category"]');
+        const categoryPrompt = page.locator('[data-form="prompt"]');
+        await categoryPrompt.waitFor();
+        await categoryPrompt.locator('[name="value"]').fill(promptValue);
+        await categoryPrompt.locator('[type="submit"]').click();
         await page.waitForFunction((category) => __testApi.state.vault.categories.includes(category), promptValue);
         const addedCategoryDelete = page.locator(`[data-action="delete-category"][data-category="${promptValue}"]`);
         await addedCategoryDelete.waitFor();
@@ -334,13 +344,21 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await addedCategoryDelete.waitFor({ state: 'hidden' });
         await page.waitForFunction((category) => !__testApi.state.vault.categories.includes(category), promptValue);
         await navigate(page, 'vault', mobile);
-        await checkKeyboardAndGenerator(page);
+        await checkKeyboardDialog(page);
 
         await addEntry(page, 'Synthetic entry');
         await page.locator('.entry').filter({ hasText: 'Synthetic entry' }).click();
+        await page.locator('[data-action="delete-entry"]').click();
+        const deleteDialog = page.locator('[data-form="confirm"]');
+        await deleteDialog.waitFor();
+        assert.match(await deleteDialog.textContent(), /移至回收站/);
+        await page.screenshot({ path: path.join(outputDirectory, `confirm-dialog-${name}.png`), fullPage: true });
+        await page.keyboard.press('Escape');
+        await deleteDialog.waitFor({ state: 'hidden' });
+        assert.ok(await page.locator('[data-action="delete-entry"]').isVisible(), 'Cancel must keep the detail view open');
         await page.locator('[data-action="copy-account"]').click();
         assert.equal(await page.evaluate(() => globalThis.__syntheticClipboard), 'synthetic@example.invalid');
-        const websiteLink = page.locator('.modal a[href="https://example.invalid/"]');
+        const websiteLink = page.locator(`${mobile ? '.modal' : '.vault-inspector'} a[href="https://example.invalid/"]`);
         assert.equal(await websiteLink.getAttribute('target'), '_blank');
         assert.match(await websiteLink.getAttribute('rel'), /noopener/);
         const reveal = page.locator('[data-action="reveal-password"]');
@@ -357,6 +375,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.locator('.entry').filter({ hasText: 'Synthetic updated entry' }).waitFor();
         await page.locator('.entry').click();
         await page.locator('[data-action="delete-entry"]').click();
+        await confirmDialog(page, /移至回收站/);
         await page.locator('.entry').waitFor({ state: 'hidden' });
         await setting(page, 'trash', mobile);
         await page.locator('[data-action="restore-entry"]').click();
@@ -468,6 +487,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.evaluate(() => JSON.stringify(__testApi.state.record)), originalRecord);
         await backupForm.locator('[name="password"]').fill(masterPassword);
         await backupForm.locator('[type="submit"]').click();
+        await confirmDialog(page, /备份已验证/);
         await page.locator('[data-form="unlock"]').waitFor();
         await unlock(page);
         assert.equal(await page.evaluate(() => __testApi.state.record.remoteSha), null);
@@ -475,22 +495,26 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
 
         await setting(page, 'sync', mobile);
         const hostileId = 'synthetic" data-injected-test="true"><img src="synthetic-invalid" onerror="globalThis.__migrationInjected=true">';
-        const migrationComplete = page.waitForEvent('dialog', { predicate: (dialog) => dialog.type() === 'alert' && dialog.message().startsWith('迁移完成：') });
+        const migrationComplete = page.locator('.modal h2', { hasText: '迁移完成' }).waitFor();
         await uploadFile(page, 'import-legacy', 'synthetic-legacy.json', Buffer.from(JSON.stringify({ entries: [
             { id: 'synthetic-legacy', siteName: 'Synthetic legacy entry', account: 'test@example.invalid', password: 'synthetic-legacy-password', type: 'Synthetic category' },
             { id: hostileId, siteName: 'Synthetic hostile ID', account: 'test@example.invalid', password: 'synthetic-hostile-password', type: '个人', url: 'javascript:globalThis.__migrationInjected=true' },
         ] })));
+        await confirmDialog(page, /旧版 JSON 包含明文密码/);
         await migrationComplete;
         await page.waitForFunction(() => __testApi.state.vault.entries.length === 3);
         assert.ok(await page.evaluate(() => __testApi.state.vault.categories.includes('Synthetic category')));
+        await page.locator('.modal-foot [data-action="close-modal"]').click();
+        await page.locator('.modal-layer').waitFor({ state: 'hidden' });
         await navigate(page, 'vault', mobile);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         assert.equal(await page.evaluate(() => globalThis.__migrationInjected === true), false);
         await page.locator('.entry').filter({ hasText: 'Synthetic hostile ID' }).click();
-        assert.equal(await page.locator('.modal a[href^="javascript:"]').count(), 0);
+        assert.equal(await page.locator('a[href^="javascript:"]').count(), 0);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         await page.locator('[data-action="delete-entry"]').click();
-        await page.locator('[data-action="delete-entry"]').waitFor({ state: 'hidden' });
+        await confirmDialog(page, /移至回收站/);
+        await page.locator('.entry').filter({ hasText: 'Synthetic hostile ID' }).waitFor({ state: 'hidden' });
         await setting(page, 'trash', mobile);
         assert.equal(await page.locator('[data-injected-test]').count(), 0);
         await page.locator('[data-action="restore-entry"]').click();
@@ -518,6 +542,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await config.waitFor({ state: 'hidden' });
         assert.equal(github.requests.filter((request) => request.url.includes('/contents/')).length, 0, 'First connection must wait for explicit initialization/import');
         await page.locator('[data-action="push-remote"]').click();
+        await confirmDialog(page, /初始化远端/);
         await page.waitForFunction(() => __testApi.state.record.remoteSha && !__testApi.state.syncing);
         assert.ok(github.payload);
         assert.ok(await page.evaluate(() => Boolean(__testApi.state.vaultKey)));
@@ -527,6 +552,14 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await addEntry(page, 'Synthetic automatic entry');
         await page.waitForFunction(() => !__testApi.state.record.dirty && !__testApi.state.syncing);
         assert.ok(github.requests.filter((request) => request.method === 'PUT').length > beforeSavePuts);
+
+        // A second poll without new remote revisions must revalidate, not
+        // download, and must not upload anything.
+        const beforeRevalidate = github.requests.length;
+        await page.evaluate(() => __testApi.synchronize({ automatic: true }));
+        const revalidation = github.requests.slice(beforeRevalidate).filter((request) => request.url.includes('/contents/'));
+        assert.ok(revalidation.length >= 1, 'an idle poll must ask GitHub for the current revision');
+        assert.ok(!revalidation.some((request) => request.method === 'PUT'), 'an unchanged remote must not be uploaded again');
 
         // Simulate another device editing a different entry using the same AES key.
         github.payload = await page.evaluate(async () => {
@@ -549,6 +582,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.ok(await page.evaluate(() => document.activeElement === __draftNode && __draftNode.isConnected));
         assert.equal(await page.locator('.sync-result[role="alert"]').count(), 0);
         await visibleClick(page, '[data-action="close-modal"]');
+        await confirmDialog(page, /放弃这次未保存的编辑/);
         github.delay = 0;
 
         // Remote changes to the entry currently being edited must prevent a stale save.
@@ -570,6 +604,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.ok(await staleEdit.isVisible());
         assert.equal(await page.evaluate((id) => __testApi.state.vault.entries.find((entry) => entry.id === id).title, targetId), 'Synthetic updated entry');
         await visibleClick(page, '[data-action="close-modal"]');
+        await confirmDialog(page, /放弃这次未保存的编辑/);
 
         // Two devices changing the same fields must expose explicit choices.
         github.payload = await page.evaluate(async ({ id, payload }) => {
@@ -641,6 +676,85 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await page.keyboard.press('Escape');
         await page.locator('[data-form="add-entry"]').waitFor({ state: 'hidden' });
         await page.setViewportSize(originalViewport);
+
+        // ── fast paths: remember this device, quick switch, search shortcut ──
+        const storedEntriesBeforeResume = await page.evaluate(() => JSON.stringify(__testApi.state.vault.entries.map((entry) => entry.title)));
+        await setting(page, 'security', mobile);
+        await page.locator('[data-action="open-enable-device-unlock"]').click();
+        const enableDevice = page.locator('[data-form="enable-device-unlock"]');
+        await enableDevice.locator('[name="password"]').fill('synthetic-wrong-password');
+        await enableDevice.locator('[type="submit"]').click();
+        await enableDevice.locator('[data-form-error]').waitFor();
+        assert.match(await enableDevice.locator('[data-form-error]').textContent(), /当前主密码错误/);
+        await enableDevice.locator('[name="password"]').fill(masterPassword);
+        await enableDevice.locator('[type="submit"]').click();
+        await enableDevice.waitFor({ state: 'hidden' });
+        await page.waitForFunction(() => __testApi.state.deviceUnlock === true);
+        const storedDevice = await page.evaluate(async () => JSON.stringify(await (await import('./vault-core.js')).dbGet('device-unlock')));
+        assert.ok(!storedDevice.includes(masterPassword));
+        assert.ok(await page.locator('.settings-panel[data-panel="security"] [data-action="open-disable-device-unlock"]').count());
+
+        // A reload on this device lands in the vault without the password.
+        await page.reload();
+        await page.locator('.app-shell').waitFor();
+        assert.equal(await page.locator('[data-form="unlock"]').count(), 0);
+        assert.equal(await page.evaluate(() => JSON.stringify(__testApi.state.vault.entries.map((entry) => entry.title))), storedEntriesBeforeResume);
+        assert.equal(await page.evaluate(() => Boolean(__testApi.state.rawVaultKey)), false, 'a resumed tab must not hold the raw key');
+        await page.screenshot({ path: path.join(outputDirectory, `resumed-${name}.png`), fullPage: true });
+
+        // The quick switch copies a password and opens the site in one keystroke.
+        // The migration fixture above has no website, so this uses the one entry
+        // that does.
+        // Open a blank tab first: the new-tab event only fires while this page is
+        // the active tab, and a bare mouse click does not give it focus.
+        const siteContext = await context.newPage();
+        await siteContext.bringToFront();
+        await siteContext.goto('about:blank');
+        // Fulfil the entry's site so the popup keeps its URL readable; an
+        // unresolvable .invalid domain would commit a browser error page first.
+        await context.route('https://example.invalid/**', (route) => route.fulfill({ body: 'ok' }));
+        await page.bringToFront();
+        await page.mouse.click(4, 4);
+        assert.ok(await page.evaluate(() => document.hasFocus()), 'the quick switch must run in a focused tab');
+        await page.evaluate(() => { globalThis.__syntheticClipboard = ''; });
+        await page.keyboard.press('Control+k');
+        const quick = page.locator('.modal.quick-switch');
+        await quick.waitFor();
+        assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('name')), 'quickQuery');
+        await page.keyboard.type('Synthetic updated');
+        assert.equal(await quick.locator('.quick-row').count(), 1);
+        // Enter copies and then opens the site, so the clipboard is asserted first.
+        const popup = context.waitForEvent('page');
+        await page.keyboard.press('Enter');
+        await quick.waitFor({ state: 'hidden' });
+        await page.waitForFunction(() => Boolean(globalThis.__syntheticClipboard));
+        assert.equal(await page.evaluate(() => globalThis.__syntheticClipboard), 'synthetic-remote-conflict-password');
+        const opened = await popup;
+        assert.match(opened.url(), /^https:\/\/example\.invalid/);
+        await opened.close();
+
+        // A search shortcut in the address bar starts the vault with that query.
+        // A fresh document is what an address-bar entry produces; a hash-only
+        // navigation would leave the already-running page untouched.
+        await page.goto('about:blank');
+        await page.goto(`${baseUrl}/#search=synthetic`);
+        await page.locator('[data-input="search"]').waitFor();
+        assert.equal(await page.locator('[data-input="search"]').inputValue(), 'synthetic');
+        assert.ok(await page.locator('.entry').count());
+        await page.keyboard.press('Slash');
+        assert.equal(await page.evaluate(() => document.activeElement?.dataset.input), 'search');
+        await siteContext.close();
+
+        // Turning it off from settings restores the password screen on the next load.
+        await setting(page, 'security', mobile);
+        await page.locator('.settings-panel[data-panel="security"] [data-action="open-disable-device-unlock"]').click();
+        await page.locator('[data-form="disable-device-unlock"] [type="submit"]').click();
+        await page.locator('[data-form="disable-device-unlock"]').waitFor({ state: 'hidden' });
+        await page.reload();
+        await page.locator('[data-form="unlock"]').waitFor();
+        assert.equal(await page.locator('[data-form="unlock"] [data-submit-as]').count(), 0, 'a withdrawn device key must not offer one-tap resume');
+        assert.equal(await page.locator('[name="keepDeviceUnlock"]').isChecked(), false);
+        await unlock(page);
 
         // A background poll must not extend the user's idle lock deadline.
         await setting(page, 'security', mobile);
