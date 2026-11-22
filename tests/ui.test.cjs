@@ -140,24 +140,6 @@ test('sortEntries pins favorites in the default order and sorts by title or crea
     assert.deepEqual(entries.map((entry) => entry.id), ['a', 'b', 'c'], 'sorting must not mutate the vault array');
 });
 
-test('password generation uses rejection sampling rather than modulo-biased bytes', async () => {
-    const { generatePassword } = await helpersPromise;
-    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*-_+';
-    const limit = Math.floor(256 / alphabet.length) * alphabet.length;
-    let calls = 0;
-    const random = (bytes) => {
-        calls += 1;
-        if (calls === 1) bytes.fill(limit);
-        else for (let index = 0; index < bytes.length; index += 1) bytes[index] = index % alphabet.length;
-        return bytes;
-    };
-    assert.equal(generatePassword(20, random), alphabet.slice(0, 20));
-    assert.equal(calls, 2, 'Bytes in the incomplete modulo range must be discarded');
-    assert.equal(generatePassword(1).length, 12);
-    assert.equal(generatePassword(999).length, 64);
-    assert.match(generatePassword(32), /^[ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*\-_+]{32}$/);
-});
-
 test('website links allow HTTP(S) and refuse scripts, local files and embedded credentials', async () => {
     const { safeWebUrl } = await helpersPromise;
     assert.equal(safeWebUrl('https://example.invalid/path?q=synthetic#section'), 'https://example.invalid/path?q=synthetic#section');

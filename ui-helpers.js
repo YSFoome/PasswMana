@@ -18,18 +18,6 @@ export function sortEntries(entries, mode = 'updated') {
     return [...entries].sort(compare);
 }
 
-export function generatePassword(length = 20, random = crypto.getRandomValues.bind(crypto)) {    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*-_+';
-    const size = Math.max(12, Math.min(64, Number(length) || 20));
-    const limit = Math.floor(256 / alphabet.length) * alphabet.length;
-    let password = '';
-    while (password.length < size) {
-        for (const byte of random(new Uint8Array(size * 2))) {
-            if (byte < limit && password.length < size) password += alphabet[byte % alphabet.length];
-        }
-    }
-    return password;
-}
-
 export function safeWebUrl(value) {
     try {
         const url = new URL(value);

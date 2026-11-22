@@ -4,6 +4,7 @@ const STORE_NAME = 'vault';
 const RECORD_KEY = 'primary';
 const ROLLBACK_KEY = 'before-restore';
 const DRAFT_KEY = 'encrypted-draft';
+const DEVICE_KEY = 'device-unlock';
 const PBKDF2_ITERATIONS = 600000;
 const MAX_CIPHERTEXT_BYTES = 64 * 1024 * 1024;
 const preparedRestores = new WeakMap();
@@ -413,3 +414,76 @@ export async function loadEncryptedDraft(record, vaultKey, rawVaultKey) {
 export async function clearEncryptedDraft() {
     return writeStoredValue(DRAFT_KEY, null);
 }
+
+// Device unlock: the vault key itself is sealed with AES-GCM under a
+// non-extractable AES-GCM key that the browser keeps for this origin. Its raw
+// bytes never enter JavaScript, so the stored blob is not a usable copy of the
+// vault key, while a reload on this device can resume without deriving the key
+// again from the master password. Any local master-password or recovery change
+// rotates it.
+const DEVICE_FORMAT = 'passwmana-device-v1';
+
+function assertDeviceCiphertext(value) {
+    assertObject(value, '设备解锁密文');
+    assertBytes(value.iv, 12, '设备解锁 IV');
+    if (base64ToBytes(value.data).byteLength !== 48) throw formatError('设备解锁密文长度不正确');
+    return value;
+}
+
+function deviceBinding(record) {
+    assertTimestamp(record.updatedAt, '更新时间');
+    // updatedAt changes on every unlock, so a seal made before this key was
+    // written yields a different binding and is discarded on read.
+    return `${record.createdAt}|${record.updatedAt}`;
+}
+
+export async function hasDeviceUnlock() {
+    const stored = await dbGet(DEVICE_KEY);
+    return stored?.format === DEVICE_FORMAT;
+}
+
+export async function saveDeviceUnlock(record, rawVaultKey) {
+    assertBytes(rawVaultKey, 32, '保险库密钥');
+    const stored = await dbGet(DEVICE_KEY);
+    // Keep the wrapping key across saves: an unlock refreshes the binding right
+    // after loading, and it must stay readable by the key already on disk.
+    const wrappingKey = stored && stored.format === DEVICE_FORMAT && stored.key instanceof CryptoKey
+        ? stored.key
+        : await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, wrappingKey, base64ToBytes(rawVaultKey));
+    await writeStoredValue(DEVICE_KEY, {
+        format: DEVICE_FORMAT,
+        binding: deviceBinding(record),
+        key: wrappingKey,
+        encrypted: { iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(data)) },
+    });
+}
+
+export async function loadDeviceUnlock(record) {
+    const stored = await dbGet(DEVICE_KEY);
+    if (!stored) return null;
+    try {
+        assertObject(stored, '设备解锁');
+        if (stored.format !== DEVICE_FORMAT || !(stored.key instanceof CryptoKey)) return null;
+        assertString(stored.binding, '设备解锁绑定', { nonempty: true, maximum: 256 });
+        const encrypted = assertDeviceCiphertext(stored.encrypted);
+        if (stored.binding !== deviceBinding(record)) return null;
+        const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(encrypted.iv) }, stored.key, base64ToBytes(encrypted.data));
+        // The ciphertext length above already fixes the payload at 32 bytes,
+        // and importVaultKey rejects any other length.
+        const vaultKey = await importVaultKey(bytesToBase64(new Uint8Array(raw)));
+        const vault = validateVault(JSON.parse(await decryptText(record.encryptedVault, vaultKey)));
+        // The password path also hands back the raw key so it can re-wrap it;
+        // resuming must not, since the browser, not this code, holds that copy.
+        return { vaultKey, vault };
+    } catch {
+        // A rotated, stale or damaged device key must fall back to the password.
+        return null;
+    }
+}
+
+export async function clearDeviceUnlock() {
+    return writeStoredValue(DEVICE_KEY, null);
+}
+
