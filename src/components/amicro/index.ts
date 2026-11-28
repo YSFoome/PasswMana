@@ -3,5 +3,8 @@ export { AmicroCopyButton, type AmicroCopyButtonProps } from './AmicroCopyButton
 export { AmicroFavoriteButton, type AmicroFavoriteButtonProps } from './AmicroFavoriteButton';
 export { AmicroSwitch, type AmicroSwitchProps } from './AmicroSwitch';
 export { AmicroSurface, type AmicroSurfaceProps } from './AmicroSurface';
+export { AmicroSpotlightCard, type AmicroSpotlightCardProps } from './AmicroSpotlightCard';
+export { AmicroSecretReveal, type AmicroSecretRevealProps } from './AmicroSecretReveal';
+export { AmicroKbd } from './AmicroKbd';
 export { AmicroDialog, type AmicroDialogProps } from './AmicroDialog';
 export { AmicroToastStack } from './AmicroToastStack';

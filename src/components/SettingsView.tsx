@@ -1,3 +1,4 @@
+import { motion } from 'motion/react';
 import { Check, Download, Paintbrush, Plus, RefreshCw, ShieldCheck, Tags, Trash2, Upload } from 'lucide-react';
 import { categoryTone, timeLabel } from '@/core/ui-helpers';
 import { vaultStore, type VaultState } from '@/core/vault-store';
@@ -40,14 +41,14 @@ export function SettingsView({ state }: { state: VaultState }) {
     return (
         <section
             className={cn(
-                'view flex-1 flex flex-col min-h-0',
+                'view settings-bento-shell flex-1 flex flex-col min-h-0',
                 state.view !== 'settings' && 'hidden',
                 state.settingsDetail && 'settings-detail',
             )}
             data-view="settings"
         >
-            <div className="settings-scroll flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-10">
-                <div className="settings-container max-w-[900px] mx-auto">
+            <div className="settings-scroll flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-9">
+                <div className="settings-container max-w-[920px] mx-auto">
                     <header className="settings-head mb-7">
                         <h1 className="m-0 mb-1.5 text-[24px] font-bold tracking-tight text-[var(--ink)]">设置</h1>
                         <p className="m-0 text-[13.5px] text-[var(--muted)]">管理同步、安全策略与界面外观。</p>
@@ -68,7 +69,15 @@ export function SettingsView({ state }: { state: VaultState }) {
                                         data-panel={key}
                                         onClick={() => vaultStore.selectSettingPanel(key)}
                                     >
-                                        <Icon className="w-4 h-4 flex-none" strokeWidth={1.8} />
+                                        {active && (
+                                            <motion.span
+                                                layoutId="settings-accent-bar"
+                                                transition={{ type: 'spring', stiffness: 500, damping: 36 }}
+                                                className="max-[899px]:hidden absolute left-1 w-1 h-4.5 rounded-full bg-[var(--accent)]"
+                                                aria-hidden="true"
+                                            />
+                                        )}
+                                        <Icon className={cn('w-4 h-4 flex-none', active && 'text-[var(--accent)]')} strokeWidth={1.8} />
                                         <span>{SETTING_LABELS[key]}</span>
                                     </button>
                                 );
@@ -85,7 +94,7 @@ export function SettingsView({ state }: { state: VaultState }) {
                                 <p className="panel-intro m-0 mb-5 text-[13.5px] text-[var(--muted)]">
                                     首次连接后，解锁、保存改动和恢复联网时自动同步密文。
                                 </p>
-                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] divide-y divide-[var(--rule)]">
+                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] shadow-[var(--specular)] divide-y divide-[var(--rule)]">
                                     <div className="setting-row p-4 flex items-center justify-between gap-3 flex-wrap">
                                         <div className="setting-copy min-w-0 flex-1 grid gap-0.5">
                                             <strong className="text-[14px] font-semibold text-[var(--ink)]">私有仓库</strong>
@@ -205,7 +214,7 @@ export function SettingsView({ state }: { state: VaultState }) {
                                 <p className="panel-intro m-0 mb-5 text-[13.5px] text-[var(--muted)]">
                                     主密码不会离开本设备，解锁后的密钥仅保存在当前会话内存中。
                                 </p>
-                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] divide-y divide-[var(--rule)]">
+                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] shadow-[var(--specular)] divide-y divide-[var(--rule)]">
                                     <div className="setting-row p-4 flex items-center justify-between gap-3 flex-wrap">
                                         <div className="setting-copy min-w-0 flex-1 grid gap-0.5">
                                             <strong className="text-[14px] font-semibold text-[var(--ink)]">自动锁定</strong>
@@ -299,30 +308,39 @@ export function SettingsView({ state }: { state: VaultState }) {
                                 <p className="panel-intro m-0 mb-5 text-[13.5px] text-[var(--muted)]">
                                     显示模式和标识色只保存在当前设备。
                                 </p>
-                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] divide-y divide-[var(--rule)]">
+                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] shadow-[var(--specular)] divide-y divide-[var(--rule)]">
                                     <div className="setting-row p-4 flex items-center justify-between gap-3 flex-wrap">
                                         <div className="setting-copy min-w-0 flex-1 grid gap-0.5">
                                             <strong className="text-[14px] font-semibold text-[var(--ink)]">显示模式</strong>
                                             <span className="text-[12.5px] text-[var(--muted)]">按系统偏好或固定浅色 / 深色</span>
                                         </div>
-                                        <div className="segmented inline-flex flex-wrap gap-1 p-1 rounded-[11px] bg-[var(--card-2)]" role="group" aria-label="显示模式">
-                                            {([['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const).map(([value, label]) => (
-                                                <button
-                                                    key={value}
-                                                    type="button"
-                                                    className={cn(
-                                                        'px-3 py-1.5 rounded-lg border-0 text-[12.5px] font-medium cursor-pointer transition-colors',
-                                                        state.mode === value
-                                                            ? 'active bg-[var(--bg-list)] text-[var(--ink)] shadow-xs font-semibold'
-                                                            : 'bg-transparent text-[var(--muted)] hover:text-[var(--ink)]',
-                                                    )}
-                                                    data-action="set-mode"
-                                                    data-mode={value}
-                                                    onClick={() => vaultStore.setThemeMode(value as ThemeMode)}
-                                                >
-                                                    {label}
-                                                </button>
-                                            ))}
+                                        <div className="segmented inline-flex flex-wrap gap-1 p-1 rounded-xl border border-[var(--rule)] bg-[var(--card-2)]" role="group" aria-label="显示模式">
+                                            {([['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const).map(([value, label]) => {
+                                                const active = state.mode === value;
+                                                return (
+                                                    <button
+                                                        key={value}
+                                                        type="button"
+                                                        className={cn(
+                                                            'relative px-3 py-1.5 rounded-lg border-0 text-[12.5px] font-medium cursor-pointer transition-colors',
+                                                            active ? 'active text-[var(--ink)] font-semibold' : 'bg-transparent text-[var(--muted)] hover:text-[var(--ink)]',
+                                                        )}
+                                                        data-action="set-mode"
+                                                        data-mode={value}
+                                                        onClick={() => vaultStore.setThemeMode(value as ThemeMode)}
+                                                    >
+                                                        {active && (
+                                                            <motion.span
+                                                                layoutId="appearance-mode-pill"
+                                                                transition={{ type: 'spring', stiffness: 520, damping: 36 }}
+                                                                className="absolute inset-0 rounded-lg bg-[var(--bg-list)] border border-[var(--rule)] shadow-xs pointer-events-none"
+                                                                aria-hidden="true"
+                                                            />
+                                                        )}
+                                                        <span className="relative z-[1]">{label}</span>
+                                                    </button>
+                                                );
+                                            })}
                                         </div>
                                     </div>
                                     <div className="setting-row p-4 flex items-center justify-between gap-3 flex-wrap">
@@ -359,7 +377,7 @@ export function SettingsView({ state }: { state: VaultState }) {
                                 <p className="panel-intro m-0 mb-5 text-[13.5px] text-[var(--muted)]">
                                     按你的习惯整理和筛选密码条目。
                                 </p>
-                                <div className="category-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] divide-y divide-[var(--rule)] mb-4">
+                                <div className="category-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] shadow-[var(--specular)] divide-y divide-[var(--rule)] mb-4">
                                     {state.vault.categories.map((category) => (
                                         <div key={category} className="category-row px-4 py-3 flex items-center justify-between gap-3">
                                             <span className="inline-flex items-center gap-2.5 text-[14px] font-medium text-[var(--ink)] min-w-0 break-words">
@@ -398,7 +416,7 @@ export function SettingsView({ state }: { state: VaultState }) {
                                 <p className="panel-intro m-0 mb-5 text-[13.5px] text-[var(--muted)]">
                                     删除的条目保留 30 天，之后会自动永久清除。
                                 </p>
-                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] divide-y divide-[var(--rule)]">
+                                <div className="setting-list rounded-2xl border border-[var(--rule)] bg-[var(--card)] shadow-[var(--specular)] divide-y divide-[var(--rule)]">
                                     {trashEntries.length ? trashEntries.map((entry) => (
                                         <div key={entry.id} className="setting-row p-4 flex items-center justify-between gap-3 flex-wrap">
                                             <div className="setting-copy min-w-0 flex-1 grid gap-0.5">

@@ -18,10 +18,11 @@ export function AmicroToastStack({ toasts }: { toasts: ToastItem[] }) {
                         initial={{ opacity: 0, y: 12, scale: 0.94 }}
                         animate={{ opacity: 1, y: 0, scale: 1 }}
                         exit={{ opacity: 0, y: 8, scale: 0.95 }}
-                        transition={{ type: 'spring', stiffness: 480, damping: 32 }}
-                        className="toast px-4 py-2.5 rounded-xl bg-[var(--ink)] text-[var(--on-ink)] text-[13.5px] font-medium shadow-[var(--shadow-float)] text-center max-w-full"
+                        transition={{ type: 'spring', stiffness: 500, damping: 32 }}
+                        className="toast inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-[var(--rule-strong)] bg-[var(--ink)] text-[var(--on-ink)] text-[13px] font-medium shadow-[var(--shadow-float)] text-center max-w-full"
                     >
-                        {item.message}
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] flex-none" aria-hidden="true" />
+                        <span>{item.message}</span>
                     </motion.div>
                 ))}
             </AnimatePresence>

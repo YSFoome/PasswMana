@@ -11,7 +11,7 @@ import {
 import { vaultStore, type VaultState } from '@/core/vault-store';
 import type { EntryFormValues, ModalState, VaultConflictItem } from '@/core/types';
 import { cn } from '@/lib/utils';
-import { AmicroButton, AmicroDialog, AmicroFavoriteButton } from './amicro';
+import { AmicroButton, AmicroDialog, AmicroFavoriteButton, AmicroKbd } from './amicro';
 import { FormErrorBanner, PasswordField, PasswordStrengthHint } from './FormHelpers';
 import { DetailFields, SyncIcon } from './VaultWorkbench';
 
@@ -734,8 +734,8 @@ function QuickSwitchModal({ modal }: { modal: Extract<ModalState, { type: 'quick
                             key={entry.id}
                             type="button"
                             className={cn(
-                                'quick-row w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border-0 bg-transparent text-left cursor-pointer transition-colors',
-                                position === index ? 'active bg-[var(--bg-selected)]' : 'hover:bg-[var(--bg-hover)]',
+                                'quick-row w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border border-transparent bg-transparent text-left cursor-pointer transition-colors',
+                                position === index ? 'active bg-[var(--bg-selected)] border-[var(--rule)]' : 'hover:bg-[var(--bg-hover)]',
                             )}
                             data-action="quick-select"
                             data-id={entry.id}
@@ -755,6 +755,18 @@ function QuickSwitchModal({ modal }: { modal: Extract<ModalState, { type: 'quick
                             <div>没有找到匹配的条目</div>
                         </div>
                     )}
+                </div>
+                <div className="px-4 py-2.5 border-t border-[var(--rule)] bg-[var(--bg-inspector)] flex items-center justify-between gap-3 text-[11.5px] text-[var(--faint)]">
+                    <span className="inline-flex items-center gap-1.5">
+                        <AmicroKbd>↑↓</AmicroKbd>
+                        <span>选择</span>
+                        <AmicroKbd className="ml-1">↵</AmicroKbd>
+                        <span>复制并打开</span>
+                    </span>
+                    <span className="inline-flex items-center gap-1.5">
+                        <AmicroKbd>Esc</AmicroKbd>
+                        <span>关闭</span>
+                    </span>
                 </div>
             </section>
         </div>

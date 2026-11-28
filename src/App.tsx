@@ -162,7 +162,7 @@ export function App() {
                 <>
                     <div className="app-shell">
                         <aside className="side-nav">
-                            <SidebarContent state={state} />
+                            <SidebarContent state={state} scope="desktop" />
                         </aside>
                         <main className="content">
                             <header className="mobile-header">
@@ -242,7 +242,7 @@ export function App() {
                         aria-modal={state.drawerOpen ? 'true' : undefined}
                         aria-label="导航"
                     >
-                        <SidebarContent state={state} />
+                        <SidebarContent state={state} scope="drawer" />
                     </aside>
 
                     <ModalHost state={state} />

@@ -1,23 +1,49 @@
+import { motion } from 'motion/react';
 import { LockKeyhole, Plus, Settings2, ShieldCheck, Star, Trash2, Vault } from 'lucide-react';
 import { categoryTone } from '@/core/ui-helpers';
 import { vaultStore, type VaultState } from '@/core/vault-store';
 import { cn } from '@/lib/utils';
 
-export function SidebarContent({ state }: { state: VaultState }) {
+function ActivePill({ layoutId }: { layoutId: string }) {
+    return (
+        <motion.span
+            layoutId={layoutId}
+            transition={{ type: 'spring', stiffness: 480, damping: 36 }}
+            className="absolute inset-0 rounded-[10px] bg-[var(--bg-selected)] border border-[var(--rule)] shadow-[var(--specular)] pointer-events-none"
+            aria-hidden="true"
+        />
+    );
+}
+
+export function SidebarContent({ state, scope = 'desktop' }: { state: VaultState; scope?: 'desktop' | 'drawer' }) {
     const status = vaultStore.syncStatus();
     const isAll = state.view === 'vault' && !state.favoriteOnly && !state.category;
     const isFav = state.view === 'vault' && state.favoriteOnly;
     const isTrash = state.view === 'settings' && state.settingPanel === 'trash';
     const isSettings = state.view === 'settings' && state.settingPanel !== 'trash';
+    const entries = state.vault?.entries || [];
+    const trashCount = state.vault?.trash.length || 0;
     const categories = state.vault?.categories || [];
+    const pillId = `sidebar-active-pill-${scope}`;
+
+    const favCount = entries.reduce((acc, e) => acc + (e.favorite ? 1 : 0), 0);
+    const catCounts = new Map<string, number>();
+    for (const entry of entries) {
+        if (entry.category) catCounts.set(entry.category, (catCounts.get(entry.category) || 0) + 1);
+    }
 
     return (
         <>
-            <div className="brand flex items-center gap-2.5 px-2.5 text-[15px] font-bold tracking-tight text-[var(--ink)]">
-                <span className="brand-mark w-7 h-7 rounded-[9px] grid place-items-center bg-[var(--accent-soft)] text-[var(--accent)]">
-                    <ShieldCheck className="w-4 h-4" strokeWidth={2} />
+            <div className="brand flex items-center justify-between gap-2 px-2">
+                <div className="flex items-center gap-2.5 text-[15px] font-bold tracking-tight text-[var(--ink)]">
+                    <span className="brand-mark w-7.5 h-7.5 rounded-[10px] grid place-items-center bg-[var(--accent-soft)] border border-[var(--accent)]/25 text-[var(--accent)] shadow-[0_0_16px_-4px_var(--accent-glow)]">
+                        <ShieldCheck className="w-4 h-4" strokeWidth={2} />
+                    </span>
+                    <span>PasswMana</span>
+                </div>
+                <span className="text-[11px] machine px-1.5 py-0.5 rounded-md bg-[var(--card-2)] border border-[var(--rule)] text-[var(--faint)]">
+                    {entries.length}
                 </span>
-                <span>PasswMana</span>
             </div>
 
             <nav className="nav-group grid gap-0.5" aria-label="主导航">
@@ -28,8 +54,10 @@ export function SidebarContent({ state }: { state: VaultState }) {
                     data-view-name="vault"
                     onClick={() => vaultStore.setView('vault')}
                 >
-                    <Vault className="w-4 h-4 flex-none" strokeWidth={1.8} />
-                    <span>全部密码</span>
+                    {isAll && <ActivePill layoutId={pillId} />}
+                    <Vault className="w-4 h-4 flex-none relative z-[1]" strokeWidth={1.8} />
+                    <span className="relative z-[1] flex-1">全部密码</span>
+                    <span className="relative z-[1] text-[11.5px] machine text-[var(--faint)]">{entries.length}</span>
                 </button>
                 <button
                     type="button"
@@ -37,13 +65,15 @@ export function SidebarContent({ state }: { state: VaultState }) {
                     data-action="nav-favorites"
                     onClick={() => vaultStore.navFavorites()}
                 >
-                    <Star className="w-4 h-4 flex-none" strokeWidth={1.8} />
-                    <span>收藏</span>
+                    {isFav && <ActivePill layoutId={pillId} />}
+                    <Star className="w-4 h-4 flex-none relative z-[1]" strokeWidth={1.8} />
+                    <span className="relative z-[1] flex-1">收藏</span>
+                    {favCount > 0 && <span className="relative z-[1] text-[11.5px] machine text-[var(--faint)]">{favCount}</span>}
                 </button>
             </nav>
 
             <div className="nav-group grid gap-0.5">
-                <div className="nav-heading flex items-center justify-between px-2.5 py-1 text-[11.5px] font-semibold tracking-wide text-[var(--faint)] uppercase">
+                <div className="nav-heading flex items-center justify-between px-2.5 py-1 text-[11px] font-semibold tracking-wider text-[var(--faint)] uppercase">
                     <span>分类</span>
                     <button
                         type="button"
@@ -56,19 +86,25 @@ export function SidebarContent({ state }: { state: VaultState }) {
                         <Plus className="w-3.5 h-3.5" strokeWidth={2} />
                     </button>
                 </div>
-                {categories.map((category) => (
-                    <button
-                        type="button"
-                        key={category}
-                        className={cn('nav-link', state.view === 'vault' && !state.favoriteOnly && state.category === category && 'active')}
-                        data-action="nav-category"
-                        data-category={category}
-                        onClick={() => vaultStore.navCategory(category)}
-                    >
-                        <i className="category-dot" data-tab={categoryTone(category)} />
-                        <span className="truncate">{category}</span>
-                    </button>
-                ))}
+                {categories.map((category) => {
+                    const active = state.view === 'vault' && !state.favoriteOnly && state.category === category;
+                    const count = catCounts.get(category) || 0;
+                    return (
+                        <button
+                            type="button"
+                            key={category}
+                            className={cn('nav-link', active && 'active')}
+                            data-action="nav-category"
+                            data-category={category}
+                            onClick={() => vaultStore.navCategory(category)}
+                        >
+                            {active && <ActivePill layoutId={pillId} />}
+                            <i className="category-dot relative z-[1]" data-tab={categoryTone(category)} />
+                            <span className="relative z-[1] flex-1 truncate">{category}</span>
+                            {count > 0 && <span className="relative z-[1] text-[11.5px] machine text-[var(--faint)]">{count}</span>}
+                        </button>
+                    );
+                })}
             </div>
 
             <nav className="nav-group grid gap-0.5" aria-label="系统导航">
@@ -78,8 +114,10 @@ export function SidebarContent({ state }: { state: VaultState }) {
                     data-action="nav-trash"
                     onClick={() => vaultStore.navTrash()}
                 >
-                    <Trash2 className="w-4 h-4 flex-none" strokeWidth={1.8} />
-                    <span>回收站</span>
+                    {isTrash && <ActivePill layoutId={pillId} />}
+                    <Trash2 className="w-4 h-4 flex-none relative z-[1]" strokeWidth={1.8} />
+                    <span className="relative z-[1] flex-1">回收站</span>
+                    {trashCount > 0 && <span className="relative z-[1] text-[11.5px] machine text-[var(--faint)]">{trashCount}</span>}
                 </button>
                 <button
                     type="button"
@@ -88,15 +126,16 @@ export function SidebarContent({ state }: { state: VaultState }) {
                     data-view-name="settings"
                     onClick={() => vaultStore.setView('settings')}
                 >
-                    <Settings2 className="w-4 h-4 flex-none" strokeWidth={1.8} />
-                    <span>设置</span>
+                    {isSettings && <ActivePill layoutId={pillId} />}
+                    <Settings2 className="w-4 h-4 flex-none relative z-[1]" strokeWidth={1.8} />
+                    <span className="relative z-[1] flex-1">设置</span>
                 </button>
             </nav>
 
             <div className="nav-footer mt-auto pt-3 border-t border-[var(--rule)] flex items-center justify-between gap-2">
                 <button
                     type="button"
-                    className="nav-status flex-1 min-w-0 flex items-center gap-2 px-2.5 py-2 rounded-[9px] border-0 bg-transparent text-[12.5px] font-medium text-[var(--muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--ink)] text-left"
+                    className="nav-status flex-1 min-w-0 flex items-center gap-2.5 px-2.5 py-2 rounded-xl border border-[var(--rule)] bg-[var(--card-2)] text-[12.5px] font-medium text-[var(--muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:border-[var(--rule-strong)] hover:text-[var(--ink)] text-left transition-colors"
                     data-action="open-sync"
                     data-sync-status={status.status}
                     title={status.detail}
@@ -107,9 +146,9 @@ export function SidebarContent({ state }: { state: VaultState }) {
                 </button>
                 <button
                     type="button"
-                    className="icon-button w-8 h-8 inline-grid place-items-center rounded-lg border-0 bg-transparent text-[var(--faint)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--ink)]"
+                    className="icon-button w-9 h-9 inline-grid place-items-center rounded-xl border border-[var(--rule)] bg-[var(--card-2)] text-[var(--faint)] cursor-pointer hover:bg-[var(--bg-hover)] hover:border-[var(--rule-strong)] hover:text-[var(--ink)] transition-colors"
                     data-action="lock"
-                    title="立即锁定"
+                    title="立即锁定 (Ctrl+Shift+L)"
                     aria-label="立即锁定"
                     onClick={() => vaultStore.lockVault()}
                 >
