@@ -7,6 +7,7 @@ const path = require('node:path');
 // All credentials and entries below are synthetic. GitHub is always intercepted.
 const masterPassword = 'synthetic-master-password-2026';
 const repositoryRoot = path.resolve(__dirname, '..');
+const distRoot = path.join(repositoryRoot, 'dist');
 const bundledPlaywright = path.join(os.homedir(), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'node', 'node_modules', 'playwright');
 let playwright;
 try {
@@ -16,11 +17,11 @@ try {
 }
 
 function serveRepository() {
-    const types = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
+    const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
     const server = http.createServer((request, response) => {
         const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
-        const filename = path.resolve(repositoryRoot, `.${pathname === '/' ? '/index.html' : pathname}`);
-        if (!filename.startsWith(`${repositoryRoot}${path.sep}`)) {
+        const filename = path.resolve(distRoot, `.${pathname === '/' ? '/index.html' : pathname}`);
+        if (!filename.startsWith(`${distRoot}${path.sep}`)) {
             response.writeHead(403).end();
             return;
         }
@@ -262,6 +263,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
     const name = mobile ? 'mobile' : 'desktop';
     const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 900 }, serviceWorkers: 'block', acceptDownloads: true });
     await context.addInitScript(() => {
+        globalThis.__PASSWMANA_ENABLE_TEST_API__ = true;
         globalThis.__syntheticClipboard = '';
         Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
             async writeText(value) { globalThis.__syntheticClipboard = value; },
@@ -280,10 +282,6 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
     // Native dialogs are no longer used by the app; any that appear are a bug.
     const observeDialogs = (observedPage) => observedPage.on('dialog', (dialog) => { browserErrors.push(`native ${dialog.type()} dialog: ${dialog.message()}`); dialog.dismiss(); });
     observeDialogs(page);
-    await context.route('**/app.js', async (route) => {
-        const source = await fs.promises.readFile(path.join(repositoryRoot, 'app.js'), 'utf8');
-        await route.fulfill({ contentType: 'text/javascript', body: `${source}\nglobalThis.__testApi = { state, encryptText, decryptText, remoteRecord, persistVault, synchronize, lockVault, createVault, resetLockTimer, scheduleAutoSync };` });
-    });
     await context.route('https://api.github.com/**', async (route) => {
         const request = route.request();
         const method = request.method();
@@ -690,7 +688,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         await enableDevice.locator('[type="submit"]').click();
         await enableDevice.waitFor({ state: 'hidden' });
         await page.waitForFunction(() => __testApi.state.deviceUnlock === true);
-        const storedDevice = await page.evaluate(async () => JSON.stringify(await (await import('./vault-core.js')).dbGet('device-unlock')));
+        const storedDevice = await page.evaluate(async () => JSON.stringify(await __testApi.dbGet('device-unlock')));
         assert.ok(!storedDevice.includes(masterPassword));
         assert.ok(await page.locator('.settings-panel[data-panel="security"] [data-action="open-disable-device-unlock"]').count());
 
@@ -774,10 +772,7 @@ async function runScenario(browser, baseUrl, outputDirectory, mobile) {
         assert.equal(await page.evaluate(() => __testApi.state.vaultKey), null);
         assert.equal(await page.evaluate(() => __testApi.state.rawVaultKey), null);
         await unlock(page);
-        const encryptedDraft = await page.evaluate(async () => {
-            const { dbGet } = await import('./vault-core.js');
-            return JSON.stringify(await dbGet('encrypted-draft'));
-        });
+        const encryptedDraft = await page.evaluate(async () => JSON.stringify(await __testApi.dbGet('encrypted-draft')));
         assert.ok(!encryptedDraft.includes('synthetic-idle-draft-password'));
         assert.ok(!encryptedDraft.includes('Synthetic idle draft'));
         await page.locator('[data-action="resume-draft"]').click();

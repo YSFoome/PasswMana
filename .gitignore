@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.claude/
+design/
+.DS_Store
+*.local

@@ -1,9 +1,9 @@
-// Zero-dependency static server for local preview, mirroring `npx serve .`.
+// Static preview server for built dist/ output.
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(__dirname, '..', 'dist');
 const port = Number(process.env.PORT) || 4173;
 const types = {
     '.html': 'text/html; charset=utf-8',

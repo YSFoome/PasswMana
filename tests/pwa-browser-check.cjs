@@ -3,9 +3,10 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { generateWorker, shellPaths } = require('../scripts/generate-sw.cjs');
+const { generateWorker, discoverShellPaths } = require('../scripts/generate-sw.cjs');
 
 const repositoryRoot = path.resolve(__dirname, '..');
+const distRoot = path.join(repositoryRoot, 'dist');
 const bundledPlaywright = path.join(os.homedir(), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'node', 'node_modules', 'playwright');
 let playwright;
 try { playwright = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright'); }
@@ -13,12 +14,13 @@ catch { playwright = require(bundledPlaywright); }
 
 function prepareFixture() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'passwmana-real-sw-'));
+    const shellPaths = discoverShellPaths(distRoot);
     for (const scope of ['PasswMana', 'Other']) {
         const destinationRoot = path.join(root, scope);
         for (const filename of [...shellPaths, './sw.js']) {
             const target = path.join(destinationRoot, filename);
             fs.mkdirSync(path.dirname(target), { recursive: true });
-            fs.copyFileSync(path.join(repositoryRoot, filename), target);
+            fs.copyFileSync(path.join(distRoot, filename), target);
         }
         fs.writeFileSync(path.join(destinationRoot, 'sw.js'), generateWorker(destinationRoot).source);
     }
@@ -157,7 +159,8 @@ async function scenario(browser, mobile, screenshotDirectory) {
         const appRoot = path.join(root, 'PasswMana');
         const indexPath = path.join(appRoot, 'index.html');
         fs.writeFileSync(indexPath, fs.readFileSync(indexPath, 'utf8').replace('<title>PasswMana</title>', '<title>PasswMana synthetic release 2</title>'));
-        fs.appendFileSync(path.join(appRoot, 'app.js'), '\nglobalThis.__pwaRelease = "synthetic-release-2";\n');
+        const entryJs = fs.readdirSync(path.join(appRoot, 'assets')).find((file) => file.endsWith('.js'));
+        fs.appendFileSync(path.join(appRoot, 'assets', entryJs), '\nglobalThis.__pwaRelease = "synthetic-release-2";\n');
         fs.writeFileSync(path.join(appRoot, 'sw.js'), generateWorker(appRoot).source);
         await page.evaluate(async () => { await (await navigator.serviceWorker.getRegistration()).update(); });
         await waitForAsyncCondition(page, async () => Boolean((await navigator.serviceWorker.getRegistration()).waiting), 'new worker waits for consent');

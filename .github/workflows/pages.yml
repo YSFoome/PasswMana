@@ -24,10 +24,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Prepare offline shell
-        run: node scripts/generate-sw.cjs
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+      - name: Build production bundle and offline shell
+        run: npm run build
       - name: Run unit regressions
-        run: node --test tests/*.test.cjs
+        run: npm test
       - name: Install isolated browser test runtime
         run: |
           npm install --prefix "$RUNNER_TEMP/passwmana-browser" --no-save --no-package-lock playwright@1.62.1
@@ -68,9 +73,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Prepare public application files
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build and prepare public application files
         run: |
-          node scripts/generate-sw.cjs
+          npm run build
           node scripts/prepare-pages.cjs "$RUNNER_TEMP/passwmana-site"
       - name: Upload static files
         uses: actions/upload-pages-artifact@v3

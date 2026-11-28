@@ -1,27 +1,40 @@
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const path = require('node:path');
-const { pathToFileURL } = require('node:url');
-const { webcrypto } = require('node:crypto');
+import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
+import { beforeAll, test } from 'vitest';
+import * as core from '../src/core/vault-core';
+import type { EncryptedRecord, VaultEntry } from '../src/core/types';
 
 // Synthetic data only; real Web Crypto is used for every encryption operation.
-globalThis.crypto = webcrypto;
-const corePromise = import(pathToFileURL(path.join(__dirname, '..', 'vault-core.js')).href);
+if (!globalThis.crypto) {
+    (globalThis as any).crypto = webcrypto;
+}
+
 const password = 'synthetic-core-master-password';
 const recoveryCode = 'ABCDE-FGHIJ-KLMNO-PQRST';
 const timestamp = '2026-10-08T00:00:00.000Z';
-let fixture;
+let fixture: core.PreparedRestore;
 
-function clone(value) {
+function clone<T>(value: T): T {
     return structuredClone(value);
 }
 
-function entry(id = 'legacy-entry-id') {
-    return { id, title: 'Synthetic title', username: 'synthetic@example.invalid', password: 'synthetic-entry-password', category: '个人', url: 'https://example.invalid', notes: '', favorite: false, createdAt: timestamp, updatedAt: timestamp };
+function entry(id = 'legacy-entry-id'): VaultEntry {
+    return {
+        id,
+        title: 'Synthetic title',
+        username: 'synthetic@example.invalid',
+        password: 'synthetic-entry-password',
+        category: '个人',
+        url: 'https://example.invalid',
+        notes: '',
+        favorite: false,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+    };
 }
 
 function memoryIndexedDb() {
-    let records = new Map();
+    let records = new Map<string, unknown>();
     let failNextWrite = false;
     let closed = 0;
     const api = {
@@ -29,18 +42,18 @@ function memoryIndexedDb() {
         failWrite() { failNextWrite = true; },
         closed: () => closed,
         open() {
-            const request = {};
+            const request: any = {};
             setImmediate(() => {
                 request.result = {
                     objectStoreNames: { contains: () => true },
                     close() { closed += 1; },
-                    transaction(_name, mode) {
+                    transaction(_name: string, mode: string) {
                         const values = new Map([...records].map(([key, value]) => [key, clone(value)]));
                         let pending = 0;
                         let ended = false;
-                        const transaction = { error: null };
-                        const schedule = (operation) => {
-                            const operationRequest = {};
+                        const transaction: any = { error: null };
+                        const schedule = (operation: () => unknown) => {
+                            const operationRequest: any = {};
                             pending += 1;
                             setImmediate(() => {
                                 if (ended) return;
@@ -64,8 +77,8 @@ function memoryIndexedDb() {
                             return operationRequest;
                         };
                         transaction.objectStore = () => ({
-                            get(key) { return schedule(() => clone(values.get(key))); },
-                            put(value, key) {
+                            get(key: string) { return schedule(() => clone(values.get(key))); },
+                            put(value: unknown, key: string) {
                                 const saved = clone(value);
                                 return schedule(() => {
                                     if (failNextWrite) {
@@ -76,7 +89,7 @@ function memoryIndexedDb() {
                                     return key;
                                 });
                             },
-                            delete(key) { return schedule(() => values.delete(key)); },
+                            delete(key: string) { return schedule(() => values.delete(key)); },
                         });
                         return transaction;
                     },
@@ -89,13 +102,11 @@ function memoryIndexedDb() {
     return api;
 }
 
-test.before(async () => {
-    const core = await corePromise;
+beforeAll(async () => {
     fixture = await core.createVault(password, recoveryCode);
 });
 
-test('default categories are copied for each vault', async () => {
-    const core = await corePromise;
+test('default categories are copied for each vault', () => {
     const first = core.defaultVault();
     first.categories.push('Synthetic custom category');
     assert.deepEqual(core.defaultVault().categories, ['工作', '个人', '金融']);
@@ -103,7 +114,6 @@ test('default categories are copied for each vault', async () => {
 });
 
 test('a generated record unlocks with master password and recovery key', async () => {
-    const core = await corePromise;
     assert.equal(core.validateEncryptedRecord(fixture.record), fixture.record);
     const unlocked = await core.unlockWithMaster(fixture.record, password);
     const recovered = await core.unlockWithRecovery(fixture.record, `  ${recoveryCode.toLowerCase()}  `);
@@ -114,8 +124,7 @@ test('a generated record unlocks with master password and recovery key', async (
 });
 
 test('canonical Base64, IV, salt and wrapped key lengths are required', async () => {
-    const core = await corePromise;
-    const mutations = [
+    const mutations: Array<(record: any) => void> = [
         (record) => { record.masterSalt = core.randomBase64(15); },
         (record) => { record.recoverySalt = core.randomBase64(17); },
         (record) => { record.masterSalt = `${record.masterSalt}\n`; },
@@ -137,16 +146,15 @@ test('canonical Base64, IV, salt and wrapped key lengths are required', async ()
     for (const value of ['Zg', 'Zg===', 'Zh==', ' Zg==', '', null, {}]) {
         assert.throws(() => core.base64ToBytes(value), { code: 'format' });
     }
-    assert.deepEqual(core.base64ToBytes('Zg=='), Uint8Array.from([102]));
+    assert.deepEqual(core.base64ToBytes('Zg=='), new Uint8Array([102]));
     await assert.rejects(core.importVaultKey(core.randomBase64(31)), { code: 'format' });
 });
 
-test('vault validation accepts opaque legacy IDs but rejects duplicate and malformed content', async () => {
-    const core = await corePromise;
+test('vault validation accepts opaque legacy IDs but rejects duplicate and malformed content', () => {
     const valid = core.defaultVault();
     valid.entries.push(entry('legacy-"<>& id'));
     assert.equal(core.validateVault(valid), valid);
-    const mutations = [
+    const mutations: Array<(vault: any) => void> = [
         (vault) => { vault.trash.push(clone(vault.entries[0])); },
         (vault) => { vault.entries[0].username = {}; },
         (vault) => { vault.entries[0].favorite = 'false'; },
@@ -169,7 +177,6 @@ test('vault validation accepts opaque legacy IDs but rejects duplicate and malfo
 });
 
 test('unlock refuses authenticated ciphertext containing invalid vault JSON', async () => {
-    const core = await corePromise;
     const record = clone(fixture.record);
     record.encryptedVault = await core.encryptText(JSON.stringify({ entries: 'invalid' }), fixture.vaultKey);
     await assert.rejects(core.unlockWithMaster(record, password), { code: 'format' });
@@ -183,9 +190,8 @@ test('unlock refuses authenticated ciphertext containing invalid vault JSON', as
 });
 
 test('backup restore validates before writing and atomically preserves a rollback copy', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
+    (globalThis as any).indexedDB = database;
     await core.dbPut(fixture.record);
     const changedVault = clone(fixture.vault);
     changedVault.entries.push(entry());
@@ -196,12 +202,12 @@ test('backup restore validates before writing and atomically preserves a rollbac
     backup.lastSyncedAt = timestamp;
     await assert.rejects(core.prepareBackupRestore({ record: backup }, { masterPassword: 'wrong-synthetic-password' }), { name: 'OperationError' });
     assert.deepEqual(await core.dbGet(), fixture.record);
-    await assert.rejects(core.commitBackupRestore({ record: backup }), { code: 'format' });
+    await assert.rejects(core.commitBackupRestore({ record: backup } as any), { code: 'format' });
     const prepared = await core.prepareBackupRestore({ record: backup }, { masterPassword: password });
     assert.deepEqual(await core.dbGet(), fixture.record, 'Preparing a backup must not replace the current vault');
     prepared.record.masterSalt = 'caller-mutation-must-not-be-committed';
     await core.commitBackupRestore(prepared);
-    const current = await core.dbGet();
+    const current = (await core.dbGet())!;
     assert.equal(current.remoteSha, null);
     assert.equal(current.dirty, true);
     assert.equal(current.syncBase, undefined);
@@ -214,29 +220,29 @@ test('backup restore validates before writing and atomically preserves a rollbac
 });
 
 test('a failed restore transaction keeps the original vault and previous rollback copy', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
+    (globalThis as any).indexedDB = database;
     await core.dbPut(fixture.record);
     const candidate = await core.prepareBackupRestore(fixture.record, { masterPassword: password });
     database.failWrite();
     await assert.rejects(core.commitBackupRestore(candidate), { name: 'QuotaExceededError' });
     assert.deepEqual(await core.dbGet(), fixture.record);
     assert.equal(await core.getRollbackRecord(), null);
-    // A verified candidate remains retryable after a storage failure.
     await core.commitBackupRestore(candidate);
     assert.deepEqual(await core.getRollbackRecord(), fixture.record);
 });
 
 test('drafts stay encrypted, are vault-bound and tolerate damaged ciphertext', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
-    const draft = { type: 'add-entry', values: { title: 'Synthetic unfinished entry', username: '', password: 'synthetic-draft-password', category: '个人', url: '', notes: '', favorite: false } };
+    (globalThis as any).indexedDB = database;
+    const draft = {
+        type: 'add-entry' as const,
+        values: { title: 'Synthetic unfinished entry', username: '', password: 'synthetic-draft-password', category: '个人', url: '', notes: '', favorite: false },
+    };
     await core.saveEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey, draft);
-    const stored = database.records().get('encrypted-draft');
-    assert.ok(!JSON.stringify(stored).includes(draft.values.password));
-    assert.ok(!JSON.stringify(stored).includes(draft.values.title));
+    const stored = database.records().get('encrypted-draft') as any;
+    assert.ok(!JSON.stringify(stored).includes(draft.values.password!));
+    assert.ok(!JSON.stringify(stored).includes(draft.values.title!));
     assert.deepEqual(await core.loadEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey), draft);
     const sameVaultWithNewPassword = { ...fixture.record, masterSalt: core.randomBase64(16) };
     assert.deepEqual(await core.loadEncryptedDraft(sameVaultWithNewPassword, fixture.vaultKey, fixture.rawVaultKey), draft);
@@ -250,11 +256,10 @@ test('drafts stay encrypted, are vault-bound and tolerate damaged ciphertext', a
 });
 
 test('edit draft retains the original entry snapshot and restore clears obsolete drafts', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
+    (globalThis as any).indexedDB = database;
     const original = entry();
-    const draft = { type: 'edit-entry', entryId: original.id, entry: original, values: { title: 'Synthetic draft title', favorite: true } };
+    const draft = { type: 'edit-entry' as const, entryId: original.id, entry: original, values: { title: 'Synthetic draft title', favorite: true } };
     await core.saveEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey, draft);
     assert.deepEqual(await core.loadEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey), draft);
     await assert.rejects(core.saveEncryptedDraft(fixture.record, fixture.vaultKey, fixture.rawVaultKey, { ...draft, entryId: 'other-id' }), { code: 'format' });
@@ -263,34 +268,29 @@ test('edit draft retains the original entry snapshot and restore clears obsolete
 });
 
 test('device unlock resumes the vault key without the master password and withdraws cleanly', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
+    (globalThis as any).indexedDB = database;
     await core.dbPut(fixture.record);
     assert.equal(await core.hasDeviceUnlock(), false);
     assert.equal(await core.loadDeviceUnlock(fixture.record), null);
 
-    // A fresh authentication writes a new updatedAt, which the seal is bound to.
-    const authenticated = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
+    const authenticated: EncryptedRecord = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
     await core.saveDeviceUnlock(authenticated, fixture.rawVaultKey);
     assert.equal(await core.hasDeviceUnlock(), true);
-    const stored = database.records().get('device-unlock');
+    const stored = database.records().get('device-unlock') as any;
     const serialized = JSON.stringify(stored);
-    // The key that protects the blob is not extractable and its bytes never land
-    // in storage; the vault key itself only appears as ciphertext.
     assert.equal(stored.key.extractable, false);
     assert.ok(!serialized.includes(fixture.rawVaultKey));
     assert.ok(!serialized.includes('wrappedVaultKey'));
 
-    const resumed = await core.loadDeviceUnlock(authenticated);
-    assert.equal(resumed.rawVaultKey, undefined);
+    const resumed = (await core.loadDeviceUnlock(authenticated))!;
+    assert.equal((resumed as any).rawVaultKey, undefined);
     assert.deepEqual(resumed.vault, fixture.vault);
     const raw = await crypto.subtle.exportKey('raw', resumed.vaultKey).catch(() => null);
     assert.equal(raw, null, 'the imported session key stays non-extractable');
     const reread = await core.decryptText(authenticated.encryptedVault, resumed.vaultKey);
     assert.deepEqual(JSON.parse(reread), fixture.vault);
 
-    // A record that moved on since the seal cannot be resumed from it.
     assert.equal(await core.loadDeviceUnlock({ ...authenticated, updatedAt: '2026-10-10T10:00:00.000Z' }), null);
     assert.equal(await core.loadDeviceUnlock({ ...authenticated, createdAt: '2026-10-10T00:00:00.000Z' }), null);
 
@@ -300,15 +300,13 @@ test('device unlock resumes the vault key without the master password and withdr
 });
 
 test('a damaged or absent device unlock never blocks the password path', async () => {
-    const core = await corePromise;
     const database = memoryIndexedDb();
-    globalThis.indexedDB = database;
-    const authenticated = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
+    (globalThis as any).indexedDB = database;
+    const authenticated: EncryptedRecord = { ...fixture.record, updatedAt: '2026-10-10T09:00:00.000Z' };
     await core.saveDeviceUnlock(authenticated, fixture.rawVaultKey);
-    const stored = database.records().get('device-unlock');
+    const stored = database.records().get('device-unlock') as any;
     stored.encrypted.data = core.randomBase64(32);
     assert.equal(await core.loadDeviceUnlock(authenticated), null);
-    // The master password still opens the same record.
     const unlocked = await core.unlockWithMaster(authenticated, password);
     assert.deepEqual(unlocked.vault, fixture.vault);
 });
