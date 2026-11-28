@@ -1,50 +1,15 @@
 // Generated asset hashes are refreshed by node scripts/generate-sw.cjs.
 // BEGIN GENERATED SHELL
-const SHELL_VERSION = '418cee0358a749d91e38325cf06c6c35325aef7383d2a700e9dae6be34082211';
-const APP_SHELL = [
-    {
-        "path": "./index.html",
-        "sha256": "461a70ec7d8bceafc9ab27bfd847a0ab08c8a66ddcaf2931652c9ceb41206e01"
-    },
-    {
-        "path": "./styles.css",
-        "sha256": "afa3df106f64b87b6b57b6e544ef0804e04fc7035373901c2ee88d9fbd1a2ad3"
-    },
-    {
-        "path": "./app.js",
-        "sha256": "b2094c8bbdbc344096c9bab4c3eb45a90e1871b8ce9a49f80ad42455f2e435d5"
-    },
-    {
-        "path": "./vault-core.js",
-        "sha256": "7523dc677dc567bc4f70d3a2c550a1dc51621aeb8519ff3573ce9322ef1edf1d"
-    },
-    {
-        "path": "./sync-core.js",
-        "sha256": "02274982d96efabb23c4055a42125ae58d66380261b49d6fe99f4b791b9a482c"
-    },
-    {
-        "path": "./ui-helpers.js",
-        "sha256": "b18aa0f5c3c8877972c5ad4c345d6805a1944146fed87931e66a27f598f8ef65"
-    },
-    {
-        "path": "./manifest.webmanifest",
-        "sha256": "2b91246ad2f2eec46811ddc150b620f6c09153d03b2c4cfcd1a64dc243fedeb5"
-    },
-    {
-        "path": "./icon.svg",
-        "sha256": "ac57f5d5ed3e598fc87c7d2ba38eba1e88fd6f4651ce9be7c8759fc2742e37f6"
-    },
-    {
-        "path": "./vendor/lucide-0.468.0.min.js",
-        "sha256": "3411692820cb8d47543f69496aa25fd603a358f4498046f41c508a5a3342210e"
-    }
-];
 // END GENERATED SHELL
 
 const scopeUrl = new URL(self.registration.scope);
 const CACHE_PREFIX = `passwmana-shell-${encodeURIComponent(scopeUrl.pathname)}-`;
 const CACHE_NAME = `${CACHE_PREFIX}${SHELL_VERSION}`;
 const shellUrls = new Map(APP_SHELL.map((asset) => [new URL(asset.path, scopeUrl).pathname, new URL(asset.path, scopeUrl).href]));
+const legacyUrls = new Set([
+    './index.html', './styles.css', './app.js', './vault-core.js', './sync-core.js',
+    './ui-helpers.js', './manifest.webmanifest', './icon.svg', './vendor/lucide-0.468.0.min.js',
+].map((asset) => new URL(asset, scopeUrl).pathname));
 const indexUrl = new URL('./index.html', scopeUrl).href;
 
 async function verifyAsset(response, expectedHash) {
@@ -83,7 +48,7 @@ async function cleanLegacyCaches() {
     const requests = await cache.keys();
     const belongsToApp = (request) => {
         const url = new URL(request.url);
-        return url.origin === scopeUrl.origin && (url.pathname === scopeUrl.pathname || shellUrls.has(url.pathname));
+        return url.origin === scopeUrl.origin && (url.pathname === scopeUrl.pathname || shellUrls.has(url.pathname) || legacyUrls.has(url.pathname));
     };
     if (requests.every(belongsToApp)) {
         await caches.delete(legacyCacheName);
